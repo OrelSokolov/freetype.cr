@@ -4,3 +4,9 @@
 /tmp_c/c_oracle
 /tmp_c/*.txt
 /tmp_c/*.bin
+
+# B2 debug infra: trace oracle (patched FT master build) + ad-hoc probes
+/tmp_c/ttoracle/
+/tmp_c/trig_oracle
+/tmp_check/
+trace_*.txt

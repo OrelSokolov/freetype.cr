@@ -14,7 +14,8 @@ lib LibFT
   alias Long = Int64
 
   FT_LOAD_DEFAULT    = 0
-  FT_LOAD_NO_HINTING = 0x10
+  FT_LOAD_NO_HINTING = 0x2  # (1L << 1); the earlier 0x10 was
+                           # FT_LOAD_VERTICAL_LAYOUT
   FT_LOAD_RENDER     = 0x4
   FT_LOAD_NO_BITMAP  = 0x8
   FT_PIXEL_MODE_GRAY = 2
