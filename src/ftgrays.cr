@@ -57,7 +57,9 @@ module Ftgrays
   end
 
   # One coverage cell: exact area accumulated inside pixel (x, ey).
-  private class Cell
+  # A flat struct stored in the raster's per-row arrays — no allocation
+  # per cell (rows are reused across renders, only cleared).
+  private struct Cell
     property x : TCoord
     property cover : TArea = 0
     property area : TArea = 0
@@ -71,6 +73,10 @@ module Ftgrays
     class_property lines_log : Array(String)? = nil
     class_property conic_log : Array(String)? = nil
 
+    # Cell storage: one sorted-by-x array of cell structs per bitmap row,
+    # kept across renders (a render only clears the rows it uses) — no
+    # per-render or per-cell allocation once warmed up. The current cell
+    # is (@cell_row, @cell_col); -1 row = the dumpster outside the clip.
     @buf : Bytes = Bytes.new(0)
     @width : Int32 = 0
     @height : Int32 = 0
@@ -78,10 +84,11 @@ module Ftgrays
     @min_ey : Int32 = 0
     @max_ex : Int32 = 0
     @max_ey : Int32 = 0
-    @ycells : Array(Array(Cell)) = [] of Array(Cell)
+    @rows : Array(Array(Cell)) = [] of Array(Cell)
+    @cell_row : Int32 = -1
+    @cell_col : Int32 = -1
     @x : TPos = 0
     @y : TPos = 0
-    @cell : Cell? = nil
     @tx : Int64 = 0 # 26.6 translation folded into the upscale
     @ty : Int64 = 0
 
@@ -103,10 +110,14 @@ module Ftgrays
       @min_ey = 0
       @max_ex = width
       @max_ey = height
-      @ycells = Array(Array(Cell)).new(height) { [] of Cell }
+      while @rows.size < height
+        @rows << [] of Cell
+      end
+      height.times { |r| @rows[r].clear }
+      @cell_row = -1
+      @cell_col = -1
       @x = 0
       @y = 0
-      @cell = nil
       @tx = tx
       @ty = ty
 
@@ -262,10 +273,10 @@ module Ftgrays
     # for the sweep, but are never written as pixels).
     private def set_cell(ex : TCoord, ey : TCoord) : Nil
       if ey < @min_ey || ey >= @max_ey || ex >= @max_ex
-        @cell = nil
+        @cell_row = -1
       else
         ex = {ex, @min_ex - 1}.max
-        row = @ycells[ey - @min_ey]
+        row = @rows.unsafe_fetch(ey - @min_ey)
 
         # Binary search the sorted-by-x cell row (the C code walks a
         # linked list kept in the same order).
@@ -273,28 +284,32 @@ module Ftgrays
         hi = row.size
         while lo < hi
           mid = (lo + hi) // 2
-          if row[mid].x < ex
+          if row.unsafe_fetch(mid).x < ex
             lo = mid + 1
           else
             hi = mid
           end
         end
 
-        if lo < row.size && row[lo].x == ex
-          @cell = row[lo]
+        if lo < row.size && row.unsafe_fetch(lo).x == ex
+          @cell_row = ey - @min_ey
+          @cell_col = lo
         else
-          cell = Cell.new(ex)
-          row.insert(lo, cell)
-          @cell = cell
+          row.insert(lo, Cell.new(ex))
+          @cell_row = ey - @min_ey
+          @cell_col = lo
         end
       end
     end
 
     # FT_INTEGRATE: add cover `a` and trapezoid area `a*b` to the cell.
     private def integrate(a : Int32, b : Int32) : Nil
-      if cell = @cell
+      if @cell_row >= 0
+        row = @rows.unsafe_fetch(@cell_row)
+        cell = row.unsafe_fetch(@cell_col)
         cell.cover = cell.cover &+ a
         cell.area = cell.area &+ a &* b
+        row[@cell_col] = cell
       end
     end
 
@@ -593,7 +608,7 @@ module Ftgrays
       fill = (o.flags & FT_OUTLINE_EVEN_ODD_FILL) != 0 ? 0x100 : Int32::MIN
 
       @height.times do |ey| # y up; the buffer is top-down
-        row = @ycells[ey]
+        row = @rows.unsafe_fetch(ey)
         x = @min_ex
         cover : TArea = 0
         line = (@height - 1 - ey) * @width

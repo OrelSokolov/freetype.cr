@@ -30,6 +30,9 @@ module TT
   # Per-instruction trace to STDERR, mirroring the C interpreter's
   # FT_DEBUG_LEVEL_TRACE dump (opcode + top-of-stack). Enable with TT_TRACE=1.
   TRACE_ENABLED = ENV["TT_TRACE"]? == "1"
+  # Opcode frequency counter for profiling (prints on context GC... run end
+  # is impractical here; read via ExecContext.opcode_counts). TT_OPCOUNT=1.
+  OPCOUNT_ENABLED = ENV["TT_OPCOUNT"]? == "1"
 
   class ExecutionError < Exception
     getter code : Int32
@@ -466,7 +469,11 @@ module TT
       @zp0 = @pts
       @zp1 = @pts
       @zp2 = @pts
+      @opcode_counts = Array(Int64).new(256, 0_i64)
     end
+
+    # Per-opcode execution counts (profiling; see OPCOUNT_ENABLED).
+    getter opcode_counts : Array(Int64)
 
     # ---- glue-visible properties -----------------------------------------
 
@@ -4399,8 +4406,10 @@ module TT
           err(ERR_EXECUTION_TOO_LONG, "TT_RunIns: execution too long")
         end
 
-        @opcode = @code[@ip]
+        @opcode = @code.unsafe_fetch(@ip)
         @length = 1
+
+        @opcode_counts[@opcode] &+= 1 if OPCOUNT_ENABLED
 
         if TRACE_ENABLED
           cnt = {8_i64, @top}.min
@@ -4428,7 +4437,7 @@ module TT
         end
 
         # First, let's check for empty stack and overflow
-        @args_base = @top - (POP_PUSH_COUNT[@opcode] >> 4).to_i64
+        @args_base = @top - (POP_PUSH_COUNT.unsafe_fetch(@opcode) >> 4).to_i64
 
         # `args' is the top of the stack once arguments have been popped.
         if @args_base < 0
@@ -4438,7 +4447,7 @@ module TT
 
           # push zeroes onto the stack
           i = 0
-          pops = (POP_PUSH_COUNT[@opcode] >> 4)
+          pops = (POP_PUSH_COUNT.unsafe_fetch(@opcode) >> 4)
           while i < pops
             @stack[i] = 0
             i += 1
@@ -4446,7 +4455,7 @@ module TT
           @args_base = 0
         end
 
-        @new_top = @args_base + (POP_PUSH_COUNT[@opcode] & 15).to_i64
+        @new_top = @args_base + (POP_PUSH_COUNT.unsafe_fetch(@opcode) & 15).to_i64
 
         # `new_top' is the new top of the stack, after the instruction's
         # execution.

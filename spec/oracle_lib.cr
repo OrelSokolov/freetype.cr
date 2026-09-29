@@ -123,20 +123,22 @@ def load_outline(face, gid, flags) : Snapshot?
   Snapshot.new(ol)
 end
 
-# FT_New_Memory_Face does not copy the font buffer, and Crystal's GC may
-# collect a String once it is no longer referenced — a live face would
-# then read freed memory (garbage outlines, load errors). Copy the bytes
-# into malloc'd (non-GC) memory instead and keep the pointer for the
-# face's lifetime. This mirrors egui.cr holding @font_data as a field.
+# FT_New_Memory_Face does not copy the font buffer. Crystal's
+# Pointer#malloc goes through the Boehm GC: once the compiler considers
+# the FtFace wrapper dead, the GC may hand the bytes to something else
+# while the live face keeps reading them (observed as FT
+# Invalid_Argument storms in long benchmark loops). Allocate through
+# libc malloc instead — memory the GC never touches or reuses. The
+# process frees it at exit; FtFace has no done path by design.
 class FtFace
   getter face : LibFT::FaceRec*
 
   def initialize(library : Void*, path : String)
     data = File.read(path)
-    @buf = Pointer(UInt8).malloc(data.bytesize)
-    data.to_unsafe.copy_to(@buf, data.bytesize)
+    @buf = LibC.malloc(data.bytesize)
+    data.to_unsafe.copy_to(@buf.as(UInt8*), data.bytesize)
     @face = Pointer(LibFT::FaceRec).null
-    err = LibFT.new_memory_face(library, @buf, data.bytesize, 0, pointerof(@face))
+    err = LibFT.new_memory_face(library, @buf.as(UInt8*), data.bytesize, 0, pointerof(@face))
     raise "FT_New_Memory_Face(#{path}) failed: #{err}" if err != 0
   end
 

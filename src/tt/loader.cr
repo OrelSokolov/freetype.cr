@@ -116,8 +116,33 @@ module TT
     @backward_compat = false
     @hinting_enabled = true # cleared when prep sets instruct_control bit 0
 
+    # Hot-path scratch (reused across glyphs; nothing here escapes):
+    # parsed simple-glyph points, the scaled zone copies, and the VM's
+    # per-glyph CVT/storage restores.
+    @chain = Set(Int32).new
+    @scr_glyf_xs = Array(Int64).new(64, 0_i64)
+    @scr_glyf_ys = Array(Int64).new(64, 0_i64)
+    @scr_glyf_tags = Array(UInt8).new(64, 0_u8)
+    @scr_glyf_contours = Array(Int32).new(8, 0)
+    @scr_cur_x = Array(Int64).new(64, 0_i64)
+    @scr_cur_y = Array(Int64).new(64, 0_i64)
+    @scr_org_x = Array(Int64).new(64, 0_i64)
+    @scr_org_y = Array(Int64).new(64, 0_i64)
+    @scr_orus_x = Array(Int64).new(64, 0_i64)
+    @scr_orus_y = Array(Int64).new(64, 0_i64)
+    @scr_tags = Array(UInt8).new(68, 0_u8)
+    @scr_contours = Array(Int32).new(8, 0)
+    @scr_cvt = Array(Int64).new(0, 0_i64)
+    @scr_storage = Array(Int64).new(0, 0_i64)
+    @scr_pp = Array({Int64, Int64}).new(4, {0_i64, 0_i64})
+
     def initialize(data : Bytes)
-      @font = Font.new(data)
+      # Copy the buffer: callers routinely pass a slice into a temporary
+      # String (File.read(...).to_slice), which the GC may collect while
+      # the face is alive — the parsed tables would silently go garbage
+      # mid-run. Fonts are a few hundred KB; the copy is the cheap half
+      # of this safety.
+      @font = Font.new(data.dup)
       @exec = TT::ExecContext.new(
         font.max_functions,
         font.max_instruction_defs,
@@ -129,6 +154,11 @@ module TT
 
     def num_glyphs : Int32
       font.num_glyphs
+    end
+
+    # Profiling helper (see TT::OPCOUNT_ENABLED).
+    def opcode_counts : Array(Int64)
+      @exec.opcode_counts
     end
 
     def set_pixel_size(px : Int32) : Nil
@@ -184,8 +214,9 @@ module TT
       hinted_load = hint # FT flag state (grid-fit applies to it)
       hint = false unless @hinting_enabled
 
-      acc = Acc.new
-      pp = load_glyph_rec(gid, 0, hint, acc, Set(Int32).new)
+      acc = Acc.new # fresh per glyph: its arrays ship out in LoadedGlyph
+      @chain.clear
+      pp = load_glyph_rec(gid, 0, hint, acc, @chain)
 
       acc.xs.map! { |x| x &- pp[0][0] } if pp[0][0] != 0
       advance = pp[1][0] &- pp[0][0]
@@ -224,14 +255,14 @@ module TT
       aw, lsb = font.h_metrics(gid)
       tsb, ah = font.v_metrics(gid, y_max)
 
-      # tt_loader_set_pp (font units).
+      # tt_loader_set_pp (font units) -- into the shared scratch (the
+      # array travels down the composite recursion unchanged).
       pp1x = x_min.to_i64 &- lsb
-      pp = [
-        {pp1x, 0_i64},
-        {pp1x &+ aw, 0_i64},
-        {0_i64, y_max.to_i64 &+ tsb},
-        {0_i64, y_max.to_i64 &+ tsb &- ah},
-      ]
+      pp = @scr_pp
+      pp[0] = {pp1x, 0_i64}
+      pp[1] = {pp1x &+ aw, 0_i64}
+      pp[2] = {0_i64, y_max.to_i64 &+ tsb}
+      pp[3] = {0_i64, y_max.to_i64 &+ tsb &- ah}
       # v40, non-mono render mode: pp3.x = pp4.x = advance / 2 (C division).
       half = aw.to_i64 // 2
       pp[2] = {half, pp[2][1]}
@@ -247,8 +278,7 @@ module TT
       if n_contours > 0
         # simple glyph: phantoms are scaled together with the points in
         # TT_Process_Simple_Glyph -- pp stays in font units here
-        g = font.simple_glyph(gid).not_nil!
-        process_simple(g, pp, hint, acc)
+        process_simple(gid, pp, hint, acc)
       else
         # composite: scale phantom points (ttgload.c lines ~1795-1807)
         scale_pp(pp)
@@ -267,33 +297,41 @@ module TT
       pp[3] = {Fixed.mulfix(pp[3][0], @x_scale), Fixed.mulfix(pp[3][1], @y_scale)}
     end
 
-    private def process_simple(g : SimpleGlyph, pp : Array({Int64, Int64}),
+    private def process_simple(gid : Int32, pp : Array({Int64, Int64}),
                                hint : Bool, acc : Acc) : Nil
-      n_real = g.n_points
+      # Parse into scratch (reused) buffers.
+      n_real, instructions, _x_min, _y_min, _x_max, _y_max = font.simple_glyph_into(
+        gid, @scr_glyf_xs, @scr_glyf_ys, @scr_glyf_tags, @scr_glyf_contours)
+      raise ParseError.new("simple glyph expected") if n_real == 0
       n = n_real + 4
 
-      cur_x = Array(Int64).new(n, 0_i64)
-      cur_y = Array(Int64).new(n, 0_i64)
-      n_real.times do |i|
-        cur_x[i] = g.xs[i]
-        cur_y[i] = g.ys[i]
-      end
-      cur_x[n_real] = pp[0][0]; cur_y[n_real] = pp[0][1]
-      cur_x[n_real + 1] = pp[1][0]; cur_y[n_real + 1] = pp[1][1]
-      cur_x[n_real + 2] = pp[2][0]; cur_y[n_real + 2] = pp[2][1]
-      cur_x[n_real + 3] = pp[3][0]; cur_y[n_real + 3] = pp[3][1]
+      cur_x = @scr_cur_x
+      cur_y = @scr_cur_y
+      cur_x.clear; cur_y.clear
+      cur_x.concat(@scr_glyf_xs)
+      cur_y.concat(@scr_glyf_ys)
+      cur_x << pp[0][0]; cur_y << pp[0][1]
+      cur_x << pp[1][0]; cur_y << pp[1][1]
+      cur_x << pp[2][0]; cur_y << pp[2][1]
+      cur_x << pp[3][0]; cur_y << pp[3][1]
 
       # orus copy happens BEFORE scaling (font units) when hinted.
-      orus_x = cur_x.dup
-      orus_y = cur_y.dup
+      orus_x = @scr_orus_x
+      orus_y = @scr_orus_y
+      orus_x.clear; orus_x.concat(cur_x)
+      orus_y.clear; orus_y.concat(cur_y)
 
       n.times do |i|
         cur_x[i] = Fixed.mulfix(cur_x[i], @x_scale)
         cur_y[i] = Fixed.mulfix(cur_y[i], @y_scale)
       end
 
-      tags = g.tags.dup + [0_u8, 0_u8, 0_u8, 0_u8]
-      contours = g.contour_ends.dup
+      tags = @scr_tags
+      tags.clear
+      tags.concat(@scr_glyf_tags)
+      tags << 0_u8; tags << 0_u8; tags << 0_u8; tags << 0_u8
+      contours = @scr_contours
+      contours.clear; contours.concat(@scr_glyf_contours)
 
       pp[0] = {cur_x[n - 4], cur_y[n - 4]}
       pp[1] = {cur_x[n - 3], cur_y[n - 3]}
@@ -301,18 +339,16 @@ module TT
       pp[3] = {cur_x[n - 1], cur_y[n - 1]}
 
       if hint
-        hint_glyph(cur_x, cur_y, tags, contours, n, g.instructions,
+        hint_glyph(cur_x, cur_y, tags, contours, n, instructions,
                    is_composite: false, pp: pp,
                    zone_start: 0, orus_x: orus_x, orus_y: orus_y)
       end
 
       base = acc.n_points
-      n_real.times do |i|
-        acc.xs << cur_x[i]
-        acc.ys << cur_y[i]
-        acc.tags << tags[i]
-      end
-      g.contour_ends.each { |e| acc.contour_ends << e + base }
+      acc.xs.concat(cur_x[0, n_real])
+      acc.ys.concat(cur_y[0, n_real])
+      acc.tags.concat(tags[0, n_real])
+      contours.each { |e| acc.contour_ends << e + base }
     end
 
     private def process_composite(g : CompositeGlyph, pp : Array({Int64, Int64}),
@@ -441,13 +477,22 @@ module TT
                            orus_x : Array(Int64)?, orus_y : Array(Int64)?) : Nil
       n_ins = instructions.size
 
-      org_x = n_ins > 0 ? cur_x.dup : nil
-      org_y = n_ins > 0 ? cur_y.dup : nil
+      # org = copy of cur, taken BEFORE phantom rounding (scratch buffers).
+      org_x = nil
+      org_y = nil
+      if n_ins > 0
+        org_x = @scr_org_x
+        org_y = @scr_org_y
+        org_x.clear; org_x.concat(cur_x)
+        org_y.clear; org_y.concat(cur_y)
+      end
 
       if is_composite
         # instructions refer to the already-hinted, scaled subglyphs
-        orus_x = cur_x.dup
-        orus_y = cur_y.dup
+        orus_x = @scr_orus_x
+        orus_y = @scr_orus_y
+        orus_x.clear; orus_x.concat(cur_x)
+        orus_y.clear; orus_y.concat(cur_y)
       end
 
       # round phantom points
@@ -496,10 +541,9 @@ module TT
     private def vm_run_glyph(cur_x, cur_y, org_x, org_y, orus_x, orus_y,
                              tags, contours, n, is_composite, code) : Nil
       exec = @exec
-      # per-glyph reset: CVT/storage revert to the post-prep state, GS to
-      # the saved subset on top of defaults (TT_Load_Context + TT_Run_Context)
-      exec.cvt = @cvt_base.dup
-      exec.storage = @storage_base.dup
+      # per-glyph reset: load_context (inside run) restores CVT/storage
+      # from the exec's post-prep bases and the GS to the saved subset on
+      # top of defaults (TT_Load_Context + TT_Run_Context)
       exec.graphics_state = vm_gs_from(@size_gs)
       # ttgload.c: v40 grayscale sets backward_compatibility from
       # instruct_control bit 2 before each glyph run.

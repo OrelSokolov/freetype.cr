@@ -38,6 +38,12 @@ module Ftrender
     end
   end
 
+  # Rasterizer reused across glyphs (its cell rows warm up and stop
+  # allocating after the first few renders). NOT thread-safe — the
+  # glyph bake is single-threaded per face in both freetype-cr and the
+  # egui backend; concurrent bakes would need their own Raster.
+  @@raster = Ftgrays::Raster.new
+
   # FT_RENDER_MODE_NORMAL equivalent for a 26.6 outline (y up).
   def self.render_glyph(outline : Ftgrays::Outline) : GlyphBitmap
     return GlyphBitmap.blank if outline.xs.empty? || outline.contours.empty?
@@ -67,7 +73,7 @@ module Ftrender
     x_shift = -64_i64 &* left
     y_shift = 64_i64 &* height &- 64_i64 &* top
 
-    buffer = Ftgrays::Raster.new.render(outline, width, height, x_shift, y_shift)
+    buffer = @@raster.render(outline, width, height, x_shift, y_shift)
     GlyphBitmap.new(width, height, left, top, buffer)
   end
 end

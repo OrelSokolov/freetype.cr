@@ -558,10 +558,31 @@ module TT
 
     # Decoded simple glyph, or nil when the glyph is composite/empty.
     def simple_glyph(gid : Int32) : SimpleGlyph?
+      xs = Array(Int64).new(0, 0_i64)
+      ys = Array(Int64).new(0, 0_i64)
+      tags = Array(UInt8).new(0, 0_u8)
+      contour_ends = Array(Int32).new(0, 0)
+      n, instructions, x_min, y_min, x_max, y_max =
+        simple_glyph_into(gid, xs, ys, tags, contour_ends)
+      return nil if n == 0
+      SimpleGlyph.new(x_min, y_min, x_max, y_max, contour_ends, tags, xs, ys, instructions)
+    end
+
+    # Fill variant for the hot path: decodes into caller-owned (reused)
+    # buffers, returning the point count (0 = not a simple glyph). The
+    # instructions are returned as a slice of the font data.
+    def simple_glyph_into(gid : Int32, xs : Array(Int64), ys : Array(Int64),
+                          tags : Array(UInt8), contour_ends : Array(Int32),
+                          ) : {Int32, Bytes, Int32, Int32, Int32, Int32}
+      xs.clear; ys.clear; tags.clear; contour_ends.clear
       d = glyph_bytes(gid)
-      return nil if d.size < 10
+      if d.size < 10
+        return {0, Bytes.new(0), 0, 0, 0, 0}
+      end
       n_contours = i16(d, 0).to_i32
-      return nil unless n_contours > 0
+      if n_contours <= 0
+        return {0, Bytes.new(0), 0, 0, 0, 0}
+      end
 
       x_min = i16(d, 2).to_i32
       y_min = i16(d, 4).to_i32
@@ -573,11 +594,11 @@ module TT
       raise ParseError.new("bad contours array") if p + 2*n_contours + 2 > limit
 
       n_points = 0
-      contour_ends = Array(Int32).new(n_contours) do |i|
+      n_contours.times do |i|
         e = u16(d, p + 2*i).to_i32
         raise ParseError.new("non-monotonic contour ends") if e < n_points
         n_points = e + 1
-        e
+        contour_ends << e
       end
       p += 2*n_contours
 
@@ -588,69 +609,66 @@ module TT
       p += n_ins
 
       # point flags (with repeats)
-      tags = Array(UInt8).new(n_points, 0_u8)
       i = 0
       while i < n_points
         raise ParseError.new("flags overrun") if p >= limit
         c = d[p]
         p += 1
-        tags[i] = c
+        tags << c
         i += 1
         if c & REPEAT_FLAG != 0
-          raise ParseError.new("repeat count overrun") if p >= limit
+          raise ParseError.new("flags overrun") if p >= limit
           count = d[p]
           p += 1
           raise ParseError.new("repeat overrun") if i + count > n_points
           count.times do
-            tags[i] = c
+            tags << c
             i += 1
           end
         end
       end
 
-      xs = Array(Int64).new(n_points, 0_i64)
-      ys = Array(Int64).new(n_points, 0_i64)
       x = 0_i64
       i.times do |k|
-        f = tags[k]
+        f = tags.unsafe_fetch(k)
         if f & X_SHORT_VECTOR != 0
-          raise ParseError.new("x coords overrun") if p >= limit
-          delta = d[p].to_i64
+          raise ParseError.new("flags overrun") if p >= limit
+          delta = d.unsafe_fetch(p).to_i64
           p += 1
           delta = -delta if f & X_POSITIVE == 0
         elsif f & SAME_X == 0
           raise ParseError.new("x coords overrun") if p + 2 > limit
-          delta = i16(d, p).to_i64
+          delta = ((d.unsafe_fetch(p).to_u16 << 8) | d.unsafe_fetch(p + 1)).to_i16!.to_i64
           p += 2
         else
           delta = 0_i64
         end
         x &+= delta
-        xs[k] = x
+        xs << x
       end
       y = 0_i64
       i.times do |k|
-        f = tags[k]
+        f = tags.unsafe_fetch(k)
         if f & Y_SHORT_VECTOR != 0
-          raise ParseError.new("y coords overrun") if p >= limit
-          delta = d[p].to_i64
+          raise ParseError.new("flags overrun") if p >= limit
+          delta = d.unsafe_fetch(p).to_i64
           p += 1
           delta = -delta if f & Y_POSITIVE == 0
         elsif f & SAME_Y == 0
           raise ParseError.new("y coords overrun") if p + 2 > limit
-          delta = i16(d, p).to_i64
+          delta = ((d.unsafe_fetch(p).to_u16 << 8) | d.unsafe_fetch(p + 1)).to_i16!.to_i64
           p += 2
         else
           delta = 0_i64
         end
         y &+= delta
-        ys[k] = y
+        ys << y
         # TT_Load_Simple_Glyph masks tags to the on-curve bit while
         # reading the y coordinates.
         tags[k] = f & ON_CURVE_POINT
       end
 
-      SimpleGlyph.new(x_min, y_min, x_max, y_max, contour_ends, tags, xs, ys, instructions)
+      {n_points, instructions, x_min, y_min, x_max, y_max}
     end
 
     # Decoded composite glyph, or nil when the glyph is simple/empty.
