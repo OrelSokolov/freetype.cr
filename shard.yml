@@ -1,0 +1,6 @@
+name: freetype-cr
+version: 0.1.0
+description: |
+  Crystal port of FreeType's ftgrays anti-aliasing rasterizer (step B1 of
+  PLAN.md): pixel-exact glyph coverage without libfreetype. The system
+  FreeType stays as a test oracle only.

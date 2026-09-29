@@ -1,0 +1,6 @@
+# build artifacts
+*.o
+.ftdiff_*
+/tmp_c/c_oracle
+/tmp_c/*.txt
+/tmp_c/*.bin
