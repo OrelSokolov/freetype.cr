@@ -82,6 +82,7 @@ lib LibFT
                                            a_face : FaceRec**) : Int32
   fun set_pixel_sizes = FT_Set_Pixel_Sizes(face : FaceRec*, pixel_width : UInt32,
                                            pixel_height : UInt32) : Int32
+  fun get_char_index = FT_Get_Char_Index(face : FaceRec*, char_code : UInt32) : UInt32
   fun load_glyph = FT_Load_Glyph(face : FaceRec*, glyph_index : UInt32,
                                  load_flags : Int32) : Int32
   fun done_face = FT_Done_Face(face : FaceRec*) : Int32

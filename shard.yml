@@ -1,6 +1,8 @@
 name: freetype-cr
-version: 0.1.0
+version: 0.2.0
 description: |
-  Crystal port of FreeType's ftgrays anti-aliasing rasterizer (step B1 of
-  PLAN.md): pixel-exact glyph coverage without libfreetype. The system
-  FreeType stays as a test oracle only.
+  Crystal port of FreeType's TrueType pipeline: the ftgrays
+  anti-aliasing rasterizer (B1) and the ttinterp bytecode hinter with an
+  SFNT loader (B2) — pixel-exact hinted glyphs without libfreetype. The
+  system FreeType stays as a test oracle only. Consumed by egui.cr as
+  backend CrystalFonts.

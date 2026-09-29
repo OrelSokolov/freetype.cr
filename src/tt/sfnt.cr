@@ -6,7 +6,8 @@
 #     + interpreter maxima), `hhea'/`hmtx', `vhea'/`vmtx', `OS/2' (typo
 #     metrics for the vertical phantom emulation of TT_Get_VMetrics),
 #     `loca'/`glyf' (simple + composite glyph decoding), `cvt ', `fpgm',
-#     `prep'.
+#     `prep', `cmap' (formats 4/12, FT's default-charmap selection) and
+#     `kern' (legacy format 0) for codepoint lookup and kerning.
 #
 # Only what the pipeline needs is parsed; variations (fvar/gvar), embedded
 # bitmaps and hdmx are intentionally out of scope.
@@ -98,6 +99,109 @@ module TT
   class ParseError < Exception
   end
 
+  # `cmap' format 4 (16-bit segmented mapping), decoded once. The lookup
+  # keeps the raw subtable because idRangeOffset addressing is positional
+  # (byte offset relative to the idRangeOffset[i] slot itself).
+  struct Cmap4
+    getter seg_ends : Array(UInt16)
+    getter seg_starts : Array(UInt16)
+    getter seg_deltas : Array(Int16)
+    getter seg_range_offs : Array(UInt16)
+    getter range_offs_base : Int32 # byte offset of idRangeOffset[] in `sub'
+    getter sub : Bytes
+
+    def initialize(@seg_ends, @seg_starts, @seg_deltas, @seg_range_offs,
+                   @range_offs_base, @sub)
+    end
+
+    def lookup(cp : Int32) : Int32
+      return 0 if cp > 0xFFFF || cp < 0
+      # Binary search the segment with end >= cp (tt_cmap4_char_index).
+      lo = 0
+      hi = @seg_ends.size
+      while lo < hi
+        mid = (lo + hi) // 2
+        if @seg_ends[mid] < cp
+          lo = mid + 1
+        else
+          hi = mid
+        end
+      end
+      return 0 if lo >= @seg_ends.size
+      return 0 if cp < @seg_starts[lo]
+      ro = @seg_range_offs[lo]
+      if ro == 0
+        return ((cp + @seg_deltas[lo].to_i32) & 0xFFFF).to_i32
+      end
+      addr = @range_offs_base + 2*lo + ro.to_i32 + 2*(cp - @seg_starts[lo].to_i32)
+      return 0 if addr < 0 || addr + 2 > @sub.size
+      g = (@sub[addr].to_u16 << 8) | @sub[addr + 1]
+      return 0 if g == 0
+      ((g + @seg_deltas[lo].to_i32) & 0xFFFF).to_i32
+    end
+  end
+
+  # `cmap' format 12 (32-bit segmented coverage), decoded once.
+  struct Cmap12
+    getter group_starts : Array(Int64)
+    getter group_ends : Array(Int64)
+    getter group_gids : Array(Int64)
+
+    def initialize(@group_starts, @group_ends, @group_gids)
+    end
+
+    def lookup(cp : Int32) : Int32
+      lo = 0
+      hi = @group_starts.size
+      while lo < hi
+        mid = (lo + hi) // 2
+        if @group_ends[mid] < cp
+          lo = mid + 1
+        else
+          hi = mid
+        end
+      end
+      return 0 if lo >= @group_starts.size
+      return 0 if cp < @group_starts[lo]
+      (@group_gids[lo] + (cp - @group_starts[lo])).to_i32
+    end
+  end
+
+  # One `kern' format 0 subtable (legacy version-0 layout, horizontal
+  # coverage only — everything else FT skips, so do we).
+  struct Kern0
+    getter pairs : Array({Int32, Int32, Int32}) # {left, right, value FUnits}
+    getter sorted : Bool
+
+    def initialize(@pairs, @sorted)
+    end
+
+    def lookup(left : Int32, right : Int32) : Int32
+      key = {left, right}
+      if @sorted
+        lo = 0
+        hi = @pairs.size
+        while lo < hi
+          mid = (lo + hi) // 2
+          l, r, v = @pairs[mid]
+          cmp = l != left ? (l <=> left) : (r <=> right)
+          if cmp < 0
+            lo = mid + 1
+          elsif cmp > 0
+            hi = mid
+          else
+            return v
+          end
+        end
+      else
+        @pairs.each do |l, r, v|
+          return v if l == left && r == right
+        end
+      end
+      0
+    end
+  end
+
   class Font
     getter num_glyphs : Int32
     getter upem : Int32
@@ -108,6 +212,9 @@ module TT
     getter os2_version : UInt16 # 0xFFFF when there is no OS/2 table
     getter typo_ascender : Int32
     getter typo_descender : Int32
+    getter os2_fs_selection : UInt16 = 0_u16 # USE_TYPO_METRICS = bit 7 (0x80)
+    getter us_win_ascent : Int32 = 0
+    getter us_win_descent : Int32 = 0
     getter hhea_ascender : Int32
     getter hhea_descender : Int32
     getter max_points : Int32
@@ -120,12 +227,17 @@ module TT
     getter cvt : Array(Int32) # raw font units
     getter fpgm : Bytes
     getter prep : Bytes
+    getter ascender : Int32 = 0   # FT_Face->ascender (see the selection below)
+    getter descender : Int32 = 0 # FT_Face->descender, negative
 
     @data : Bytes
     @glyf : Bytes = Bytes.new(0)
     @loca : Bytes = Bytes.new(0)
     @hmtx : Bytes = Bytes.new(0)
     @vmtx : Bytes = Bytes.new(0)
+    @cmap4 : Cmap4?
+    @cmap12 : Cmap12?
+    @kern_tables : Array(Kern0) = [] of Kern0
 
     def initialize(@data : Bytes)
       d = @data
@@ -189,6 +301,11 @@ module TT
           @os2_version = u16(d, os2[0])
           @typo_ascender = i16(d, os2[0] + 68).to_i32
           @typo_descender = i16(d, os2[0] + 70).to_i32
+          if os2[1] >= 78 && os2[0] + 78 <= d.size
+            @os2_fs_selection = u16(d, os2[0] + 62)
+            @us_win_ascent = u16(d, os2[0] + 74).to_i32
+            @us_win_descent = u16(d, os2[0] + 76).to_i32
+          end
         else
           @os2_version = 0xFFFF_u16
           @typo_ascender = @typo_descender = 0
@@ -206,6 +323,163 @@ module TT
 
       @fpgm = slice(tables, "fpgm")
       @prep = slice(tables, "prep")
+
+      parse_cmap(tables)
+      parse_kern(tables)
+      compute_vertical_face_metrics
+    end
+
+    # Codepoint -> glyph index through the selected Unicode submap.
+    # Returns 0 (notdef) when the font has no usable Unicode cmap —
+    # callers treat it exactly like FreeType's charmap-less faces.
+    def glyph_index(codepoint : Int32) : Int32
+      if c4 = @cmap4
+        c4.lookup(codepoint)
+      elsif c12 = @cmap12
+        c12.lookup(codepoint)
+      else
+        0
+      end
+    end
+
+    # Horizontal kerning between two glyph ids in font units
+    # (tt_face_get_kerning: the sum over every format 0 subtable).
+    def kerning(left_gid : Int32, right_gid : Int32) : Int32
+      k = 0
+      @kern_tables.each { |t| k += t.lookup(left_gid, right_gid) }
+      k
+    end
+
+    # --- cmap / kern / face metrics --------------------------------------
+
+    # Pick the subtable FreeType's find_unicode_charmap picks for a fresh
+    # face: a 32-bit Unicode map ((3,10) / (0,4) / (0,6)) beats a 16-bit
+    # one, and among equals the LAST one in the table wins (FT loops
+    # backwards). Formats 4 and 12 are decoded; anything else keeps the
+    # map empty (FT would route it through its own extra formats).
+    private def parse_cmap(tables) : Nil
+      entry = tables["cmap"]?
+      return unless entry
+      off, len = entry
+      return if len < 4 || off < 0 || off + len > @data.size
+
+      d = @data
+      n = u16(d, off + 2)
+      best32 = best16 = nil # {subtable offset}
+      i = 0
+      while i < n
+        rec = off + 4 + 8*i
+        break if rec + 8 > off + len
+        platform = u16(d, rec)
+        encoding = u16(d, rec + 2)
+        sub_off = off.to_i32 + u32(d, rec + 4).to_i32
+        # Unicode encodings FT recognises; (0,5) is variant selectors.
+        uni = platform == 0 ? encoding != 5 : platform == 3 && {1, 10}.includes?(encoding)
+        if uni && sub_off + 2 <= off + len
+          uni32 = platform == 0 ? {4, 6}.includes?(encoding) : encoding == 10
+          best16 = sub_off # forward scan with last-wins == FT's reverse scan
+          best32 = sub_off if uni32
+        end
+        i += 1
+      end
+
+      sub_off = best32 || best16
+      return unless sub_off
+      return if sub_off < 0 || sub_off + 2 > d.size
+
+      sub_end = {off + len, d.size}.min
+      return if sub_off >= sub_end
+      sub = d[sub_off, sub_end - sub_off]
+
+      case u16(sub, 0)
+      when 4
+        return if sub.size < 14
+        seg_count = (u16(sub, 6) // 2).to_i32
+        return if seg_count == 0 || 14 + 6*seg_count + 2 > sub.size
+        ends = Array(UInt16).new(seg_count) { |k| u16(sub, 14 + 2*k) }
+        starts = Array(UInt16).new(seg_count) { |k| u16(sub, 14 + 2*seg_count + 2 + 2*k) }
+        deltas = Array(Int16).new(seg_count) { |k| i16(sub, 14 + 4*seg_count + 2 + 2*k) }
+        base = 14 + 6*seg_count + 2
+        ros = Array(UInt16).new(seg_count) { |k| u16(sub, base + 2*k) }
+        @cmap4 = Cmap4.new(ends, starts, deltas, ros, base, sub)
+      when 12
+        return if sub.size < 16
+        n_groups = u32(sub, 12).to_i32
+        return if 16 + 12*n_groups > sub.size
+        starts = Array(Int64).new(n_groups) { |k| u32(sub, 16 + 12*k).to_i64 }
+        ends = Array(Int64).new(n_groups) { |k| u32(sub, 16 + 12*k + 4).to_i64 }
+        gids = Array(Int64).new(n_groups) { |k| u32(sub, 16 + 12*k + 8).to_i64 }
+        @cmap12 = Cmap12.new(starts, ends, gids)
+      end
+    end
+
+    # Legacy `kern' table (ttkern.c): version-0 layout, up to 32 subtables,
+    # only horizontal format 0 subtables kept; broken lengths clamped the
+    # same way FT clamps them.
+    private def parse_kern(tables) : Nil
+      entry = tables["kern"]?
+      return unless entry
+      off, len = entry
+      return if len < 4 || off < 0 || off + len > @data.size
+
+      d = @data
+      limit = off + len
+      p = off + 4 # skip the table version
+      num_tables = u16(d, off + 2)
+      num_tables = 32 if num_tables > 32
+
+      num_tables.times do
+        break if p + 6 > limit
+        length = u16(d, p + 2).to_i32
+        coverage = u16(d, p + 4)
+        break if length <= 6 + 8
+        p_next = {p + length, limit}.min
+
+        format = coverage >> 8
+        if format == 0 && (coverage & 3) == 1 && p + 8 <= p_next
+          num_pairs = u16(d, p + 6).to_i32
+          pairs_off = p + 14
+          if p_next - pairs_off < 6*num_pairs
+            num_pairs = (p_next - pairs_off) // 6
+          end
+          pairs = Array({Int32, Int32, Int32}).new(num_pairs) do |k|
+            q = pairs_off + 6*k
+            {u16(d, q).to_i32, u16(d, q + 2).to_i32, i16(d, q + 4).to_i32}
+          end
+          sorted = true
+          (1...num_pairs).each do |k|
+            if pairs[k][0] < pairs[k - 1][0] ||
+               (pairs[k][0] == pairs[k - 1][0] && pairs[k][1] <= pairs[k - 1][1])
+              sorted = false
+              break
+            end
+          end
+          @kern_tables << Kern0.new(pairs, sorted)
+        end
+        p = p_next
+      end
+    end
+
+    # FT_Face->ascender/descender selection (sfnt_load_face, sfobjs.c):
+    # OS/2 USE_TYPO_METRICS wins, then `hhea', with typo and usWin*
+    # fallbacks when hhea carries zeroes.
+    private def compute_vertical_face_metrics : Nil
+      if @os2_version != 0xFFFF_u16 && (@os2_fs_selection & 0x80_u16) != 0
+        @ascender = @typo_ascender
+        @descender = @typo_descender
+        return
+      end
+      @ascender = @hhea_ascender
+      @descender = @hhea_descender
+      return unless @ascender == 0 && @descender == 0
+      return if @os2_version == 0xFFFF_u16
+      if @typo_ascender != 0 || @typo_descender != 0
+        @ascender = @typo_ascender
+        @descender = @typo_descender
+      else
+        @ascender = @us_win_ascent
+        @descender = -@us_win_descent
+      end
     end
 
     # Glyph data range within `glyf' (loca[gid] .. loca[gid+1]); an empty
