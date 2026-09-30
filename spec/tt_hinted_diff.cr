@@ -1,4 +1,4 @@
-# B2 acceptance test: our TT::HintedFace hinted pipeline (sfnt.cr +
+# Hinted acceptance test: our TT::HintedFace hinted pipeline (sfnt.cr +
 # loader.cr + ttinterp.cr) vs the system FreeType on hinted fonts.
 #
 # Per glyph/size:

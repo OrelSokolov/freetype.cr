@@ -1,11 +1,11 @@
 name: freetype-cr
 version: 1.0.0
 description: |
-  Crystal port of FreeType's TrueType pipeline: the ftgrays
-  anti-aliasing rasterizer (B1) and the ttinterp bytecode hinter with an
-  SFNT loader (B2) — pixel-exact hinted glyphs without libfreetype. The
-  system FreeType stays as a test oracle only. Consumed by egui.cr as
-  backend CrystalFonts.
+  TrueType hinting and rasterization in pure Crystal: the ftgrays
+  anti-aliasing rasterizer, the ttinterp bytecode-hinting VM and an
+  SFNT loader, ported from FreeType 2.14.3 — pixel-exact hinted glyphs
+  with no libfreetype dependency. The system FreeType is used as a test
+  oracle only.
 license: MIT
 repository: https://github.com/OrelSokolov/freetype.cr
 authors:

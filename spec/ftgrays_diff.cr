@@ -1,4 +1,4 @@
-# B1 acceptance test (PLAN.md §7.2): pixel diff == 0 between our
+# Rasterizer acceptance test: pixel diff == 0 between our
 # Ftrender pipeline and the system FreeType on unhinted fonts.
 #
 #   oracle : FT_Load_Glyph( FT_LOAD_DEFAULT | FT_LOAD_RENDER )  -> bitmap
@@ -8,7 +8,7 @@
 # Fonts are auto-classified: sampled glyphs must load identically with
 # and without hinting (FT_LOAD_NO_HINTING) — for fonts without hint
 # bytecode FreeType scales and moves on, which is exactly the pipeline
-# ported here. Hinted fonts are skipped with a notice (they need B2/C).
+# ported here. Hinted fonts are skipped with a notice (they need the hinting pipeline).
 #
 # Run: crystal run --release spec/ftgrays_diff.cr [-- <font.ttf> ...]
 require "./oracle_lib"
@@ -72,7 +72,7 @@ font_paths.uniq.each do |path|
     gid += sample_step
   end
   if hinted
-    puts "skip (hinted — needs B2/C): #{File.basename(path)}"
+    puts "skip (hinted — needs the hinting pipeline): #{File.basename(path)}"
     ft_face.done
     next
   end

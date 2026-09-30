@@ -1,4 +1,4 @@
-# Unhinted-outline oracle diff for the B2 loader glue (sfnt.cr + loader.cr
+# Unhinted-outline oracle diff for the loader glue (sfnt.cr + loader.cr
 # scaling/composite path with the ttinterp stub in place): our
 # `TT::HintedFace#load_glyph(gid, hint: false)` outline (26.6, translated
 # by -pp1.x) and horizontal advance must match the system FreeType loaded

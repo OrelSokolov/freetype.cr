@@ -1,4 +1,4 @@
-# TrueType hinted-glyph loading pipeline (B2): the port of
+# TrueType hinted-glyph loading pipeline: the port of
 # ~/freetype/src/truetype/ttgload.c `load_truetype_glyph' /
 # `TT_Process_Simple_Glyph' / `TT_Process_Composite_Glyph' /
 # `TT_Hint_Glyph' / `tt_loader_init' / `tt_size_run_prep', specialised to

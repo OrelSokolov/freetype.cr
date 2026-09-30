@@ -1,192 +1,238 @@
-# freetype.cr — ftgrays + ttinterp на Crystal (этапы B1–B2 из PLAN.md)
+# freetype.cr — TrueType hinting & rasterization in pure Crystal
 
-Порт растеризатора FreeType `ftgrays.c` и интерпретатора TrueType-байткода
-`ttinterp.c` (снапшот 2.14.3, `~/freetype`) на Crystal — самодостаточный,
-без зависимостей от остального FreeType.
-Цель: unhinted- и hinted-шрифты растеризуются **пиксель-в-пиксель** как
-системная libfreetype, без самой библиотеки.
+<p align="center">
+  <img src="docs/logo.png" alt="freetype.cr logo" width="418">
+</p>
 
-**Статус B1: выполнен.** Оракул-диф (PLAN.md §7): 32 000 растеризаций
-глифов по 16 unhinted-шрифтам (Roboto всех начертаний, Noto Sans/Serif/
-Mono; размеры 12/13/16/24/37) — **диф 0 пикселей**, включая размеры
-битмапов и смещения. Синтетический smoke — 5/5.
+*The logo above was rendered by this library itself — hinted glyph
+rasterization + PNG packing, no FreeType, no FFI (`spec/gen_logo.cr`).*
 
-**Статус B2: выполнен.** Полный конвейер TTF → контур → хинтинг →
-растеризация целиком на Crystal. Приёмка: **198 790 hinted-глифов**
-(Liberation, DejaVu, Verdana, Times и др.; 12/13/16/24/37 px) —
-контур+битмап **диф 0**, плюс 80 997 unhinted-глифов — диф 0.
-Зарегистрировано 2 «версионно-чувствительных» глифа (LiberationMono,
-12/13 px), где системная libfreetype 2.13.3 расходится с мастером FT —
-наш вывод совпадает с мастером (проверено локальной сборкой).
+A self-contained Crystal port of FreeType's TrueType pipeline: the
+`ftgrays.c` anti-aliasing rasterizer, the `ttinterp.c` bytecode-hinting VM
+and the SFNT loading glue (ported from the FreeType 2.14.3 master
+snapshot). No dependency on libfreetype — or on any other part of
+FreeType. Given a TTF and a pixel size, it produces hinted or unhinted
+glyph bitmaps **pixel-for-pixel identical** to what the system
+libfreetype would render.
 
-## Состав
+## Why
 
-- `src/ftgrays.cr` — ядро: `Ftgrays::Raster` + `Ftgrays::Outline`
-  (точки 26.6, y вверх). Порт `gray_render_line` (64-битный вариант),
-  коник через DDA (`gray_render_conic`), кубик через бисекцию
-  (`gray_render_cubic`), клетки покрытия и свип с fill-rule.
-  Битовая точность перенесена явно: wrapping-арифметика (`&+ &- &*`),
-  арифметические сдвиги, C-деление `tdiv`, точная реплика `FT_UDIV`.
-  Пул клеток/биссекция полос заменены динамическими массивами
-  (интегрирование площадей от разбиения на полосы не зависит).
-- `src/ftrender.cr` — клей `ftsmooth.c`/`ftobjs.c` для
-  FT_RENDER_MODE_NORMAL: control-box → пиксельный bbox (floor/ceil как в
-  `ft_glyphslot_preset_bitmap`) → трансляция → растеризация.
-  Результат — `Ftrender::GlyphBitmap` (top-down 8-bit coverage).
+- **Drop the native dependency.** No `libfreetype.so` / `freetype.dll` to
+  ship (the Windows DLL distribution problem disappears entirely).
+- **Full control over the pipeline.** Loading, hinting and rasterization
+  are ordinary Crystal code you can step through, instrument and embed.
+- **Correct hinting without the library.** TrueType hinting is bytecode
+  (`fpgm`, `prep`, per-glyph instructions) that moves outline points;
+  there is no heuristic that approximates it. This port executes it.
 
-## Состав B2 (хинтинг)
+## Components
 
-- `src/fttrigon.cr` — порт `fttrigon.c` (тригонометрия на fixed-point:
-  `FT_Vector_Rotate`, `FT_Vector_Norm_Len` и т.п. — нужен для проекций
-  на произвольные оси в байткоде).
-- `src/tt/sfnt.cr` — минимальный парсер SFNT: head, maxp, hhea, hmtx,
-  cmap (формат 4), loca, glyf, cvt, fpgm, prep, gasp. Только то, что
-  нужно для загрузки контуров и хинтинга.
-- `src/tt/loader.cr` — порт hint-glue из `ttgload.c`/`ttobjs.c`:
-  масштабирование, `exec.run_fpgm`/`run_prep` (cvt в 26.6, как в C),
-  `backward_compatibility`, загрузка простых и композитных глифов,
-  grid-fit advance (`ft_glyphslot_grid_fit_metrics`), write-back точек,
-  scan-conversion флаг в tags[0].
-- `src/tt/ttinterp.cr` (~4 600 строк) — порт VM `ttinterp.c`: стек,
-  зоны/точки, CVT, storage, функции, ~190 опкодов; wrapping-арифметика
-  (`&+ &- &*`), C-семантика деления и сдвигов. Встроен трассер
-  (`TT_TRACE=1` — пооператорный дамп VM, нулевая стоимость при
-  выключенном флаге).
+- `src/ftgrays.cr` — the rasterizer core: `Ftgrays::Raster` +
+  `Ftgrays::Outline` (26.6 coordinates, y up). A port of
+  `gray_render_line` (64-bit variant), conics via DDA
+  (`gray_render_conic`), cubics via bisection (`gray_render_cubic`),
+  coverage cells and the sweep with fill rules. Bit-level fidelity is
+  carried over explicitly: wrapping arithmetic (`&+ &- &*`), arithmetic
+  shifts, C-style truncated division `tdiv`, an exact replica of
+  `FT_UDIV`. The cell pool / band bisection is replaced with dynamic
+  arrays (area integration is independent of the band split).
+- `src/ftrender.cr` — the `ftsmooth.c`/`ftobjs.c` glue for
+  FT_RENDER_MODE_NORMAL: control box → pixel bbox (floor/ceil as in
+  `ft_glyphslot_preset_bitmap`) → translation → rasterization. The
+  result is an `Ftrender::GlyphBitmap` (top-down 8-bit coverage).
+- `src/fttrigon.cr` — a port of `fttrigon.c` (fixed-point trigonometry:
+  `FT_Vector_Rotate`, `FT_Vector_Norm_Len`, etc. — needed for
+  projections onto arbitrary axes in the bytecode).
+- `src/tt/sfnt.cr` — a minimal SFNT parser: head, maxp, hhea, hmtx,
+  cmap (formats 4 and 12), loca, glyf, cvt, fpgm, prep, gasp, kern.
+  Only what loading outlines and hinting need.
+- `src/tt/loader.cr` — a port of the hint glue from `ttgload.c`/
+  `ttobjs.c`: scaling, `exec.run_fpgm`/`run_prep` (CVT in 26.6, as in
+  C), `backward_compatibility`, simple and composite glyph loading,
+  grid-fit advance (`ft_glyphslot_grid_fit_metrics`), point write-back,
+  the scan-conversion flag in tags[0].
+- `src/tt/ttinterp.cr` (~4 600 lines) — a port of the `ttinterp.c` VM:
+  stack, zones/points, CVT, storage, functions, ~190 opcodes;
+  wrapping arithmetic (`&+ &- &*`), C semantics for division and shifts.
+  A tracer is built in (`TT_TRACE=1` — per-instruction VM dump, zero
+  cost when the flag is off).
 
-Важная деталь: FT отдаёт шрифты без байткода (`fpgm` пуст, `prep` ≤ 7
-байт) автохинтеру (ftobjs.c:1016-1020) — поэтому unhinted-корпус
-(например, Roboto) в hinted-приёмке не участвует и покрывается отдельной
-unhinted-спекой.
+Note: FreeType hands fonts without bytecode (empty `fpgm`, `prep` ≤ 7
+bytes) to the auto-hinter (ftobjs.c:1016-1020) — so unhinted corpora
+(e.g. Roboto) are covered by a separate unhinted acceptance run rather
+than the hinted one.
 
-## Производительность: чистый Crystal vs C через FFI
+## Usage
 
-**Итог: порт вышел в ~1.8 раза медленнее пути «Crystal вызывает
-libfreetype через FFI»** (~115k против ~205k глифов/с при вариативности
-±5% машины). Оба числа измерены из Crystal — сравнение честное: C-сторона
-бенчмарка и есть реальный FFI-путь текстового стека.
+```crystal
+require "freetype-cr"
 
-`crystal run --release spec/bench_render.cr -- 100000 1000` — рендер
-100 000 глифов батчами по 1000 (батч = один шрифт на одном размере;
-корпус DejaVu/Liberation/Noto, ppem 12/16/24/37), обе стороны с
-попиксельной чексуммой результата. `ONLY=c`/`ONLY=x` — прогон одной
-стороны; `spec/bench_diff.cr` — поглифовый отладочный диф того же
+face = TT::HintedFace.new(File.read("DejaVuSans.ttf").to_slice)
+face.set_pixel_size(16)
+
+gid = face.font.glyph_index('A'.ord)
+g = face.load_glyph(gid)                    # hinted 26.6 outline + advance
+bmp = Ftrender.render_glyph(
+  Ftgrays::Outline.new(g.xs, g.ys, g.tags, g.contours))
+# bmp.width/height/left/top + bmp.buffer (8-bit coverage, top-down)
+```
+
+`load_glyph(gid, hint: false)` gives the FT_LOAD_NO_HINTING path;
+advances come back in 26.6 fixed point alongside the outline.
+
+## Accuracy
+
+Verified with an oracle-diff against the system libfreetype (FFI in the
+specs; the library itself never calls it):
+
+- **Unhinted:** 32 000 glyph rasterizations across 16 unhinted fonts
+  (every Roboto weight/style, Noto Sans/Serif/Mono; sizes 12/13/16/24/37)
+  — **0-pixel diff**, including bitmap dimensions and offsets. Synthetic
+  smoke tests: 5/5.
+- **Hinted (full pipeline — TTF → outline → hinting → rasterization,
+  entirely in Crystal):** **198 790 hinted glyphs** (Liberation, DejaVu,
+  Verdana, Times and others; 12/13/16/24/37 px) — **0 diff** on
+  outlines + bitmaps + advances, plus 80 997 unhinted glyphs — 0 diff.
+  Two "version-sensitive" glyphs are registered (LiberationMono, 12/13
+  px) where the system libfreetype 2.13.3 disagrees with the FT master
+  snapshot; this port matches the master (checked against a local
+  build).
+
+## Performance: pure Crystal vs C through FFI
+
+**Bottom line: the port is ~1.8x slower than the "Crystal calls
+libfreetype via FFI" path** (~115k vs ~205k glyphs/s, machine variance
+±5%). Both numbers are measured from Crystal, so the comparison is
+fair: the C side of the benchmark is the real FFI path of a text stack.
+
+```
+crystal run --release spec/bench_render.cr -- 100000 1000
+```
+
+renders 100 000 glyphs in batches of 1000 (batch = one font at one
+size; the DejaVu/Liberation/Noto corpus, ppem 12/16/24/37), both sides
+with a per-pixel checksum of the output. `ONLY=c`/`ONLY=x` runs one
+side; `spec/bench_diff.cr` is a per-glyph debug diff of the same
 workload.
 
-### Был ли смысл портироваться, чтобы «не дёргать FFI сотни раз»?
+### Was porting worth it "to avoid hundreds of FFI calls"?
 
-Измерим сам FFI-переход (`spec/bench_ffi.cr`, 10M вызовов, release).
-NB: строки ниже измерают РАЗНЫЕ вещи и не сравниваются между собой как
-«Crystal против C» — первая это стоимость исполнения кода без всякого
-вызова (этаж), вторая и третья — стоимость ВЫЗОВА C из Crystal:
+The FFI transition itself was measured (`spec/bench_ffi.cr`, 10M calls,
+release). NB: the rows below measure DIFFERENT things and are not a
+"Crystal vs C" comparison — the first is the cost of executing code
+with no call at all (the floor), the second and third are the cost of
+CALLING C from Crystal:
 
-| что измерено | нс |
+| what is measured | ns |
 |---|---|
-| исполняемый код Crystal: две арифметические операции, вызова нет вовсе | ~0.9 |
-| вызов тривиальной C-функции (strlen, работа ~0.5 нс) через FFI | ~3.6 |
-| вызов реальной FT_Get_Char_Index (cmap-поиск) через FFI | ~9 |
+| executed Crystal code: two arithmetic ops, no call at all | ~0.9 |
+| trivial C function call (strlen, ~0.5 ns of work) via FFI | ~3.6 |
+| real FT_Get_Char_Index call (cmap lookup) via FFI | ~9 |
 
-Читать это надо так: сам FFI-танк стоит **~3 нс сверх нативного вызова**
-(3.6 − работа strlen). На печку одного глифа (4 700–8 500 нс)
-приходится 1–3 FFI-вызова (load, опционально kerning/metrics) — то
-есть FFI-оверхед занимает **<0.5 %** времени печки. Вывод: экономия на
-FFI-вызовах сама по себе НЕ причина порта — она копеечная при печке в
-атлас (PLAN.md это и предсказывал: «производительность — не
-мотивация»). Реальные выигрыши порта — удаление внешней зависимости
-`libfreetype.so/.dll` (доставка DLL на
-Windows) и полный контроль над конвейером; цена — 1.8x по скорости,
-что для UI несущественно (полная печка всех глифов размера шрифта —
-единицы миллисекунд).
+How to read it: the FFI toll itself is **~3 ns on top of a native
+call** (3.6 − strlen's work). Baking one glyph costs 4 700–8 500 ns and
+makes 1–3 FFI calls (load, optionally kerning/metrics) — so FFI
+overhead is **<0.5 %** of a glyph bake. Saving on FFI calls is NOT by
+itself a reason for the port — it is negligible when baking into an
+atlas. The real wins are removing the external
+`libfreetype.so`/`.dll` dependency and full control of the pipeline;
+the price is 1.8x in speed, which is immaterial for UI (a full bake of
+every glyph of a font size is single-digit milliseconds).
 
-### А если FFI-вызовов действительно сотни и тысячи на кадр?
+### But what if there really are hundreds of FFI calls per frame?
 
-Проверено на живой нагрузке egui.cr (icons_browser: ~4000 иконок,
-сетка с кэшем-пулом текстур, текст тем же стеком):
+Checked on live egui.cr load (icons_browser: ~4000 icons, a grid with a
+texture-cache pool, text through the same stack):
 
-- **Текст.** После первой печки — ноль FFI на кадр: `glyph_index`,
-  кернинг и глифы мемоизируются (`AtlasFonts`), отрисовка идёт из
-  атласа. FFI живёт только в промахах кэша.
-- **Иконки.** Бейк = растеризация SVG в текстуру, один раз на
-  (источник, tint, размер); релизный бейк egui.cr вообще идёт через
-  чистый Crystal (порт NanoSVG), C-шим включён только в dev-билдах.
-  A/B на реальных иконках (`bin/svg_rasterizer --headless`, 128×128):
-  C через FFI 0.23–0.47 мс против Crystal 0.17–0.53 мс на иконку,
-  байты идентичны — на этой работе порты уже на равных.
-- **Арифметика худшего случая.** Даже если кадр делает 1000 прямых
-  FFI-вызовов — это 1000 × ~3.5 нс ≈ **3.5 мкс на кадр** при бюджете
-  16 600 мкс (60 fps) — 0.02 %. Реальные сотни вызовов на кадр в
-  egui.cr — это слой отрисовки sokol, он существует при любом выборе
-  растеризаторов/шрифтов и суммарно стоит единицы микросекунд.
+- **Text.** After the first bake — zero FFI per frame: `glyph_index`,
+  kerning and glyphs are memoized (`AtlasFonts`), drawing goes from the
+  atlas. FFI lives only in cache misses.
+- **Icons.** Baking = rasterizing an SVG into a texture, once per
+  (source, tint, size); the release bake in egui.cr goes through pure
+  Crystal (a NanoSVG port), the C shim is only in dev builds. A/B on
+  real icons (`bin/svg_rasterizer --headless`, 128×128): C via FFI
+  0.23–0.47 ms vs Crystal 0.17–0.53 ms per icon, byte-identical output
+  — on that workload the ports are already on par.
+- **Worst-case arithmetic.** Even if a frame makes 1000 direct FFI
+  calls — 1000 × ~3.5 ns ≈ **3.5 µs per frame** against a 16 600 µs
+  budget (60 fps) — 0.02 %. The real hundreds of calls per frame in
+  egui.cr are the sokol draw layer; it exists regardless of the
+  rasterizer/font choice and costs a few microseconds total.
 
-В каждом сценарии стоимость FFI-переходов ничтожна против работы,
-которую вызов выполняет; выбирать между «C через FFI» и «порт на
-Crystal» надо по стоимости самой работы (для глифов — 1.8x в пользу
-C, для SVG-иконок — паритет) и по цене зависимости, а не по числу
-вызовов.
+In every scenario the cost of the FFI transitions is negligible against
+the work the call performs; the choice between "C via FFI" and "a
+Crystal port" should be made on the cost of the work itself (for
+glyphs — 1.8x in favor of C; for SVG icons — parity) and on the price
+of the dependency, not on the number of calls.
 
-### Сделанные оптимизации (вывод порта побитно не изменился)
+### Optimizations made (the port's output stayed bit-identical)
 
-- `loader`: переиспользуемые scratch-буферы вместо ~10 аллокаций на
-  глиф (парс-буферы, cur/org/orus-копии, phantom-точки, Set цепочки
-  композитов); `simple_glyph_into` — парсинг простого глифа в
-  вызывающие буферы; bulk-копирование контура в аккумулятор.
-- `ftgrays`: клетки растеризатора — структуры в по-строчных массивах,
-  переиспользуемых между рендерами (раньше: `height+1` массив +
-  класс-объект на каждую затронутую клетку); `Ftrender` держит один
-  `Raster` на процесс, чтобы пул прогревался.
-- `ttinterp`: unsafe-чтения в головной петле VM (POP_PUSH_COUNT/код);
-  счётчик опкодов за `TT_OPCOUNT=1` (профилирование).
-- `sfnt`: unsafe-чтения при декоде координат простого глифа
-  (границы уже проверены).
+- `loader`: reusable scratch buffers instead of ~10 allocations per
+  glyph (parse buffers, cur/org/orus copies, phantom points, the
+  composite-glyph chain Set); `simple_glyph_into` parses a simple
+  glyph directly into caller buffers; bulk outline copy into the
+  accumulator.
+- `ftgrays`: rasterizer cells are structs in per-row arrays reused
+  between renders (previously: an `height+1` array + a class object per
+  touched cell); `Ftrender` keeps one `Raster` per process so the pool
+  stays warm.
+- `ttinterp`: unsafe reads in the VM main loop (POP_PUSH_COUNT/code);
+  the opcode counter behind `TT_OPCOUNT=1` (profiling).
+- `sfnt`: unsafe reads when decoding simple-glyph coordinates (bounds
+  already validated).
 
-Измеренный профиль после оптимизаций: загрузка+хинтирование ~6.0 мкс
-на глиф, растеризация ~2.6 мкс. Дальнейший выигрыш — только системный
-unsafe-доступ к зонам VM (~190 обработчиков), что резко удорожает
-ревью приёмки.
+Measured profile after the optimizations: load + hint ~6.0 µs per
+glyph, rasterization ~2.6 µs. The remaining win would be systemic
+unsafe access to VM zones (~190 handlers), which would sharply
+increase the review cost of acceptance.
 
-## Тесты
+## Tests
 
-  Важная деталь, найденная отладкой: FreeType применяет
-  `FT_Outline_Translate` **до** декомпозиции контура, поэтому середины
-  коник (`v_start`/`v_middle`, C-деление `/2` с усечением к нулю)
-  округляются на сдвинутых координатах — порт применяет сдвиг при чтении
-  точек в `decompose`, а не при апскейле.
-
-## Тесты
-
-- `crystal run spec/ftgrays_smoke.cr` — синтетика: квадрат, треугольник,
-  круг из коник, кубик, even-odd.
-- `crystal run --release spec/ftgrays_diff.cr [-- шрифты...]` —
-  приёмочный тест B1: диф против системной libfreetype (FFI-оракул,
-  PLAN.md §7). Шрифты авто-классифицируются (unhinted = контуры с
-  хинтингом и без совпадают); hinted пропускаются с пометкой (им нужны
-  B2/C). `DUMP_DIFFS=n` — ASCII-дамп первых n расхождений.
-- `crystal run --release spec/tt_unhinted_diff.cr [-- шрифты...]` —
-  полный конвейер B1+B2 без хинтинга, диф контуров/битмапов/advanсов
-  против FT_LOAD_NO_HINTING (80 997 глифов, диф 0).
-- `crystal run --release spec/tt_hinted_diff.cr [-- шрифты...]` —
-  приёмочный тест B2: hinted-глифы, сравнение контуров (точки+теги с
-  маской 0xE7 — TOUCH-биты являются внутренностями VM и между версиями
-  FT расходятся), битмапов и advanсов против FT_LOAD_DEFAULT
-  (198 790 глифов, диф 0).
+- `crystal run spec/ftgrays_smoke.cr` — synthetic shapes: a square, a
+  triangle, a circle of conics, a cubic, even-odd.
+- `crystal run --release spec/ftgrays_diff.cr [-- fonts...]` — the
+  rasterizer acceptance diff against the system libfreetype (FFI
+  oracle). Fonts are auto-classified (unhinted = outlines match with
+  and without hinting); hinted ones are skipped with a note. Runs on
+  the unhinted corpus with a 0-pixel diff. `DUMP_DIFFS=n` — ASCII dump
+  of the first n mismatches.
+- `crystal run --release spec/tt_unhinted_diff.cr [-- fonts...]` — the
+  full pipeline without hinting, a diff of outlines/bitmaps/advances
+  against FT_LOAD_NO_HINTING (80 997 glyphs, 0 diff).
+- `crystal run --release spec/tt_hinted_diff.cr [-- fonts...]` — the
+  hinted acceptance diff: outline comparison (points + tags with the
+  0xE7 mask — TOUCH bits are VM internals and vary between FT
+  versions), bitmaps and advances against FT_LOAD_DEFAULT
+  (198 790 glyphs, 0 diff).
 - `crystal run --release spec/bench_render.cr -- [total] [batch]` —
-  бенчмарк производительности: C-via-FFI против чистого Crystal (см.
-  раздел выше); `spec/bench_ffi.cr` — микробенч стоимости FFI-вызова;
-  `spec/bench_diff.cr -- [n]` — поглифовый диф того же workload.
-- `spec/interp_probe.cr` — ручные пробы VM на синтетике;
-- `tmp_c/` — standalone-сборка `ftgrays.c` из снапшота (второй оракул
-  для бисектов: вход — текстовый дамп контура, выход — coverage).
-  NB: собирается с `ftint64_shim.h` (макрос `FT_INT64`), иначе
-  компилируется старый до-2.13 путь растеризации.
-- `spec/bisect_dbg.cr` — трёхсторонний бисект глифа (наш / C-ftgrays /
-  системный FT); `spec/ffi_dbg.cr` — проверка FFI-зеркала структур;
-  `spec/circle_dbg.cr` — сверка синтетики с C-оракулом.
+  the performance benchmark (see above); `spec/bench_ffi.cr` — the
+  FFI-call-cost microbenchmark; `spec/bench_diff.cr -- [n]` — a
+  per-glyph diff of the same workload.
+- `spec/interp_probe.cr` — manual VM probes on synthetic input.
+- `tmp_c/` — a standalone build of `ftgrays.c` from the snapshot (a
+  second oracle for bisection: input is a text outline dump, output is
+  coverage). NB: must be built with `ftint64_shim.h` (the `FT_INT64`
+  macro), otherwise it compiles the pre-2.13 rasterization path.
+- `spec/bisect_dbg.cr` — a three-way glyph bisection (ours /
+  C-ftgrays / system FT); `spec/ffi_dbg.cr` — a check of the FFI
+  mirror of the FT structures; `spec/circle_dbg.cr` — synthetic
+  cross-check against the C oracle.
 
-## Дальше (по PLAN.md)
+## Implementation notes
 
-1. ~~B1: растеризатор + спека-диф (диф == 0)~~ ✓
-2. ~~B2: порт `ttinterp` + sfnt-loader, спека-диф на hinted (диф == 0)~~ ✓
-3. Включить в `LightHintedFonts` (egui.cr) вместо FFI/эвристики,
-   суперсэмплер и `freetype.cr` — в отставку (FFI остаётся как
-   debug-оракул в спеках)
-4. libfreetype удаляется из зависимостей egui.cr
+- FreeType applies `FT_Outline_Translate` **before** outline
+  decomposition, so conic midpoints (`v_start`/`v_middle`, C division
+  `/2` truncating toward zero) round on shifted coordinates — the port
+  applies the shift when reading points in `decompose`, not when
+  upscaling. Found by debugging; kept as an invariant.
+- Rendering follows FT_RENDER_MODE_NORMAL only: overlap handling
+  (FT_OUTLINE_OVERLAP) and the LCD paths are not ported — glyph baking
+  uses the plain NORMAL path.
+- Square pixel sizes, grayscale (non-mono) rendering, non-tricky fonts
+  — the scope the hint glue is specialized to (FT_LOAD_DEFAULT with
+  v40 subpixel-hinting-minimal).
 
+## License
+
+MIT — see `shard.yml`. The port is derived from the FreeType source
+(FTL/MIT-licensed); the original notices live in the file headers.

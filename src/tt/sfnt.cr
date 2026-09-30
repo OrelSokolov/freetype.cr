@@ -1,5 +1,5 @@
-# SFNT (TrueType) table parser for the self-contained hinting pipeline
-# (B2).  Mirrors what FreeType's sfnt/truetype drivers extract for glyph
+# SFNT (TrueType) table parser for the self-contained hinting pipeline.
+# Mirrors what FreeType's sfnt/truetype drivers extract for glyph
 # loading and bytecode interpretation:
 #
 #   - table directory, `head' (upem, indexToLocFormat), `maxp' (glyph count

@@ -1,5 +1,5 @@
 # Probe the system FreeType's TrueType interpreter version and related
-# runtime properties — decides which bytecode behavior B2 must replicate.
+# runtime properties — decides which bytecode behavior the port must replicate.
 # Run: crystal run --release spec/interp_probe.cr
 @[Link("freetype")]
 lib LibFT2
