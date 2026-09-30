@@ -1,16 +1,20 @@
-# FFI overhead micro-benchmark: what a C call from Crystal costs versus
-# the same work done in pure Crystal — the input to the "was it worth
-# porting instead of calling FFI hundreds of times" question answered in
-# README.md.
+# FFI overhead micro-benchmark: what a Crystal -> C call costs. Input to
+# the "was it worth porting instead of calling FFI hundreds of times"
+# question answered in README.md.
 #
-# Three measurements, 10M calls each (release). All inputs are built at
-# RUNTIME and varied per iteration so LLVM cannot fold the loops (an
-# earlier version measured 0.0 ns — the constants were computed at
-# compile time and the loops deleted):
-#   1. pure Crystal: a @[NoInline] identity method — the floor of a
-#      non-inlined Crystal call
+# Three measurements, 10M iterations each (release). NB: the rows
+# measure DIFFERENT things and are not a "Crystal vs C" race — the
+# pipeline benchmark (spec/bench_render.cr) is where the same work runs
+# on both sides (verdict there: the port is ~1.8x slower).
+#
+# All inputs are built at RUNTIME and chained on the previous result so
+# LLVM cannot fold the loops into closed forms (earlier versions
+# measured 0.0 ns — strlen is a recognized builtin and got
+# constant-folded, deleted loops and all):
+#   1. pure Crystal: an LCG arithmetic chain — executing Crystal code
+#      with NO call at all; the floor
 #   2. FFI -> libc strlen on a runtime buffer: a trivial C function, so
-#      the loop cost is almost entirely the FFI thunk
+#      the cost is almost entirely the FFI thunk (~3 ns over native)
 #   3. FFI -> libfreetype FT_Get_Char_Index on a loaded face: a REAL
 #      library call doing a cmap lookup — the per-glyph call the text
 #      stack actually makes
@@ -28,7 +32,6 @@ N = 10_000_000
 # Runtime-built so the content is unknown at compile time.
 runtime_buf = ("f" * (File.info(__FILE__).size % 7 + 4))
 ptr = runtime_buf.to_unsafe
-runtime_str = runtime_buf
 sink = 0_u64
 
 # 1. pure Crystal floor: an LCG-style arithmetic chain (each step
