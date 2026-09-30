@@ -1,5 +1,5 @@
-# Render benchmark: C FreeType (FT_Load_Glyph|FT_LOAD_RENDER through FFI)
-# vs the Crystal port (TT::HintedFace#load_glyph + Ftrender), 100 000
+# Render benchmark: libfreetype C called from Crystal through FFI
+# (FT_Load_Glyph|FT_LOAD_RENDER per glyph) vs the pure-Crystal port (TT::HintedFace#load_glyph + Ftrender), 100 000
 # glyphs total in batches (default 1000/batch). The workload is a fixed
 # deterministic sequence over the hinted corpus and a few ppem values;
 # both sides checksum every glyph (dims + advance + coverage bytes) so
@@ -158,10 +158,10 @@ if only == "x"
   exit(sum_x.zero? ? 1 : 0)
 end
 if only == "c"
-  puts "C FreeType : #{t_c.total_seconds.round(3)}s  #{"%.0f" % (TOTAL / t_c.total_seconds)} glyphs/s  (checksum #{sum_c.to_s(16)})"
+  puts "C via FFI  : #{t_c.total_seconds.round(3)}s  #{"%.0f" % (TOTAL / t_c.total_seconds)} glyphs/s  (checksum #{sum_c.to_s(16)})"
   exit(sum_c.zero? ? 1 : 0)
 end
-puts "C FreeType : #{t_c.total_seconds.round(3)}s  #{"%.0f" % (TOTAL / t_c.total_seconds)} glyphs/s  (checksum #{sum_c.to_s(16)})"
+puts "C via FFI  : #{t_c.total_seconds.round(3)}s  #{"%.0f" % (TOTAL / t_c.total_seconds)} glyphs/s  (checksum #{sum_c.to_s(16)})"
 puts "Crystal    : #{t_x.total_seconds.round(3)}s  #{"%.0f" % (TOTAL / t_x.total_seconds)} glyphs/s  (checksum #{sum_x.to_s(16)})"
 puts "ratio      : #{"%.2f" % (t_x.total_seconds / t_c.total_seconds)}x slower"
 
