@@ -315,6 +315,14 @@ module TT
         @typo_ascender = @typo_descender = 0
       end
 
+      # TrueType outlines only: CFF-flavoured OTF (no glyf/loca, 'CFF '
+      # table) and bitmap-only fonts (CBDT/sbix/CBLC) belong to other
+      # FreeType drivers and are out of scope here — reject them up front
+      # instead of crashing on an empty `loca' later.
+      unless tables.has_key?("glyf") && tables.has_key?("loca")
+        raise ParseError.new("no TrueType outlines " \
+          "(missing 'glyf'/'loca'; CFF or bitmap-only font)")
+      end
       @loca = slice(tables, "loca")
       @glyf = slice(tables, "glyf")
 
@@ -487,8 +495,10 @@ module TT
     def glyph_range(gid : Int32) : {Int32, Int32}
       raise ParseError.new("glyph index out of range") if gid < 0 || gid >= @num_glyphs
       if @index_to_loc_format == 0
-        o0 = u16(@loca, 2*gid) * 2
-        o1 = u16(@loca, 2*(gid + 1)) * 2
+        # widen before doubling: the raw offset can be up to 65535, and the
+        # doubled value up to 131070 — must not wrap in UInt16
+        o0 = u16(@loca, 2*gid).to_i32 * 2
+        o1 = u16(@loca, 2*(gid + 1)).to_i32 * 2
       else
         o0 = u32(@loca, 4*gid)
         o1 = u32(@loca, 4*(gid + 1))

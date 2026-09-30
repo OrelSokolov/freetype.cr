@@ -115,6 +115,9 @@ module TT
     @prep_px = -1
     @backward_compat = false
     @hinting_enabled = true # cleared when prep sets instruct_control bit 0
+    # First VM failure ('fpgm'/'prep'/glyph program), for diagnostics:
+    # once set, this face renders unhinted (see set_pixel_size/load_glyph).
+    getter vm_error : String?
 
     # Hot-path scratch (reused across glyphs; nothing here escapes):
     # parsed simple-glyph points, the scaled zone copies, and the VM's
@@ -143,11 +146,16 @@ module TT
       # mid-run. Fonts are a few hundred KB; the copy is the cheap half
       # of this safety.
       @font = Font.new(data.dup)
+      # Reserve extra stack slots for broken fonts (tt_size_init_bytecode in
+      # ttobjs.c): 50% more than maxStackElements, minimum +128 — e.g. the
+      # variable Ubuntu Sans Mono declares maxStackElements=0 yet ships a
+      # `prep' program that pushes values.
+      padded_stack = font.max_stack + {font.max_stack // 2, 128}.max
       @exec = TT::ExecContext.new(
         font.max_functions,
         font.max_instruction_defs,
         font.max_storage,
-        font.max_stack,
+        padded_stack,
         font.max_twilight,
       )
     end
@@ -179,15 +187,26 @@ module TT
 
       # --- `fpgm': once per face (tt_size_ready_bytecode).  C has size->cvt
       # scaled at this point; prep rescales from the raw table anyway.
+      # A VM crash is not fatal: FreeType caches the error for the size
+      # (size->bytecode_ready = error); we go one step further and keep
+      # rendering — unhinted — so a broken font can never take the app down.
       unless @fpgm_done
         exec.cvt = font.cvt.map { |v| Fixed.mulfix(v.to_i64, @tt_scale) }
-        exec.run_fpgm(font.fpgm)
+        begin
+          exec.run_fpgm(font.fpgm)
+        rescue ex : ExecutionError
+          @vm_error = "'fpgm' failed: #{ex.message}"
+        end
         @fpgm_done = true
       end
 
       # --- `prep': per size (tt_size_run_prep zeroes storage, scales the
       # CVT from cvt_raw, runs the program, saves the GS subset) ---
-      exec.run_prep(font.prep)
+      begin
+        exec.run_prep(font.prep)
+      rescue ex : ExecutionError
+        @vm_error = "#{@vm_error ? "#{@vm_error}; " : ""}'prep' failed: #{ex.message}"
+      end
 
       gs = vm_save_gs
       @cvt_base = exec.cvt_base.dup
@@ -199,6 +218,9 @@ module TT
       else
         @hinting_enabled = true
       end
+      # A failed fpgm/prep leaves half-defined functions and GS behind —
+      # never run glyph programs on such a face.
+      @hinting_enabled = false if @vm_error
       if (gs.instruct_control & 2) != 0
         gs = SizeGs.new
       end
@@ -216,7 +238,20 @@ module TT
 
       acc = Acc.new # fresh per glyph: its arrays ship out in LoadedGlyph
       @chain.clear
-      pp = load_glyph_rec(gid, 0, hint, acc, @chain)
+      begin
+        pp = load_glyph_rec(gid, 0, hint, acc, @chain)
+      rescue ex : ExecutionError
+        # A glyph program crashed the VM. FreeType fails the whole load
+        # here (callers blank the glyph); we prefer resilience — retry the
+        # same glyph unhinted, so only the hinting of THIS glyph is lost.
+        @vm_error = "#{@vm_error ? "#{@vm_error}; " : ""}gid #{gid}: #{ex.message}"
+        acc.xs.clear
+        acc.ys.clear
+        acc.tags.clear
+        acc.contour_ends.clear
+        @chain.clear
+        pp = load_glyph_rec(gid, 0, false, acc, @chain)
+      end
 
       acc.xs.map! { |x| x &- pp[0][0] } if pp[0][0] != 0
       advance = pp[1][0] &- pp[0][0]

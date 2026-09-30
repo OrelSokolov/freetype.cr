@@ -42,6 +42,11 @@ module TT
     end
   end
 
+  # Dedicated interceptable name for "the font's TrueType bytecode crashed
+  # the VM": the same class as ExecutionError, so existing rescues keep
+  # working — `rescue ex : TT::VMError` reads as intent.
+  VMError = ExecutionError
+
   # FT error codes as produced by FT_THROW with FT_Mod_Err_TrueType = 0x1200.
   ERR_INVALID_OPCODE            = 0x1200 + 0x80
   ERR_TOO_FEW_ARGUMENTS         = 0x1200 + 0x81
