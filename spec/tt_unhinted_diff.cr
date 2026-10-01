@@ -10,11 +10,25 @@ require "../src/tt/loader"
 CORPUS = {
   "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
   "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
   "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSerif-BoldItalic.ttf",
   "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf",
   "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+  "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+  "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf",
+  "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
   "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+  "/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf",
+  "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
   "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+  "/usr/share/fonts/truetype/liberation/LiberationMono-BoldItalic.ttf",
 }
 
 SIZES = {13, 16, 24}

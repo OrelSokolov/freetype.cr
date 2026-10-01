@@ -24,23 +24,44 @@ STDOUT.flush_on_newline = true
 HINTED_FONTS = {
   "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
   "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
   "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
   "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Italic.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSerif-BoldItalic.ttf",
   "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
   "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Oblique.ttf",
+  "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-BoldOblique.ttf",
   "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
   "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+  "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf",
+  "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
   "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+  "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+  "/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf",
+  "/usr/share/fonts/truetype/liberation/LiberationSerif-BoldItalic.ttf",
   "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+  "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
+  "/usr/share/fonts/truetype/liberation/LiberationMono-Italic.ttf",
+  "/usr/share/fonts/truetype/liberation/LiberationMono-BoldItalic.ttf",
 }
 
 # The system FreeType (2.13.3) disagrees with FreeType master -- and with
 # us, byte for byte -- on exactly these loads: a few points move by 1/64px
-# (verified against a locally built master oracle in tmp_c/ttoracle).
+# (verified against a locally built master oracle in tmp_c/ttoracle; the
+# same glyph 2215 diverges in every LiberationMono style).
 # Expected, not a regression; re-check when the system library is updated.
 EXPECTED_OUTLINE_DIFFS = {
   {"LiberationMono-Regular.ttf", 12, 2215},
   {"LiberationMono-Regular.ttf", 13, 2215},
+  {"LiberationMono-Bold.ttf", 12, 2215},
+  {"LiberationMono-Bold.ttf", 13, 2215},
+  {"LiberationMono-Italic.ttf", 12, 2215},
+  {"LiberationMono-Italic.ttf", 13, 2215},
+  {"LiberationMono-BoldItalic.ttf", 12, 2215},
+  {"LiberationMono-BoldItalic.ttf", 13, 2215},
 }
 
 UNHINTED_FONTS = {

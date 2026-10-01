@@ -22,7 +22,7 @@
 2. **`OverflowError`** — удвоение short-`loca` смещения в `UInt16` переполнялось на любом шрифте с `glyf` > 64 КБ (`src/tt/sfnt.cr`, `glyph_range`).
 3. **`IndexError`** — шрифты без `glyf`/`loca` (CFF `.otf`, `NotoColorEmoji.ttf`) падали на пустом `loca`; теперь чистый `ParseError "no TrueType outlines"`.
 
-Регрессий нет: оракул-тест `spec/tt_hinted_diff.cr` — PASS (198 790 глифов, побайтово совпадает с системным FreeType).
+Регрессий нет: оракул-тест `spec/tt_hinted_diff.cr` — PASS (416 470 глифов, побайтово совпадает с системным FreeType). Корпус покрывает все четыре начертания (Regular/Bold/Italic/Bold Italic) семейств DejaVu Sans/Serif/Mono и Liberation Sans/Serif/Mono; расхождения LiberationMono gid=2215 на 12/13 px — задокументированная дивергенция системной FT 2.13.3 vs master (см. `EXPECTED_OUTLINE_DIFFS`). `spec/tt_unhinted_diff.cr` — PASS (217 035 глифов, тот же корпус без Noto).
 
 ## Устойчивость к VM-ошибкам (после свипа)
 
