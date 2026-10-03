@@ -1,0 +1,67 @@
+# CI: build the shard and run the test suite.
+#
+# The acceptance specs diff our pipeline against the system libfreetype
+# via FFI (test oracle only) and expect bit-exact agreement with
+# FreeType 2.13.3 — spec/tt_hinted_diff.cr records the known
+# 2.13.3-vs-master divergences as expected. ubuntu-24.04 ships 2.13.2,
+# so the oracle is built from the 2.13.3 tarball into /usr/local to
+# keep the comparison deterministic.
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: crystal-lang/install-crystal@v1
+        with:
+          crystal: latest
+
+      - name: Install fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fonts-dejavu-core fonts-dejavu-extra fonts-liberation \
+            fonts-roboto-unhinted fonts-noto-core
+
+      - name: Build FreeType 2.13.3 oracle
+        run: |
+          set -euxo pipefail
+          curl -sSfL -o freetype.tar.xz \
+            https://download.savannah.gnu.org/releases/freetype/freetype-2.13.3.tar.xz
+          tar xf freetype.tar.xz
+          (
+            cd freetype-2.13.3
+            ./configure --prefix=/usr/local \
+              --with-harfbuzz=no --with-brotli=no --with-png=no --with-bzip2=no
+            make -j"$(nproc)"
+            sudo make install
+          )
+          sudo ldconfig
+          rm -rf freetype.tar.xz freetype-2.13.3
+          echo "LIBRARY_PATH=/usr/local/lib" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: crystal build --error-trace src/freetype-cr.cr
+
+      - name: Spec (VM degradation)
+        run: crystal spec --error-trace
+
+      - name: Smoke (synthetic shapes)
+        run: crystal run --release --error-trace spec/ftgrays_smoke.cr
+
+      - name: Rasterizer diff vs libfreetype (unhinted corpus)
+        run: crystal run --release --error-trace spec/ftgrays_diff.cr
+
+      - name: Unhinted pipeline diff vs libfreetype
+        run: crystal run --release --error-trace spec/tt_unhinted_diff.cr
+
+      - name: Hinted pipeline diff vs libfreetype
+        run: crystal run --release --error-trace spec/tt_hinted_diff.cr
