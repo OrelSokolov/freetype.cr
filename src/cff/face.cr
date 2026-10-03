@@ -11,8 +11,11 @@
 #     the final FT_MulFix scaling by x_scale — same operation order as
 #     cffgload.c (matrix, offset, scale).
 #
-# `hint: true' currently falls back to the unhinted path: the Adobe
-# hinting engine (stems/blues/counters + stem darkening) is not ported.
+# `cff_slot_load' (cffgload.c) in both modes: unhinted (the Adobe engine
+# renders the glyph at the "unity" scale, leaving font-unit coordinates)
+# and hinted (the interpreter renders into 26.6 device space directly
+# through the hint maps of cffhints.cr; non-identity FontMatrix subfonts
+# fall back to unhinted).
 
 require "../tt/sfnt"
 require "../tt/loader" # TT::LoadedGlyph
@@ -51,6 +54,11 @@ module CFF
     # An unhinted glyph at the current pixel size, shaped like
     # TT::LoadedGlyph: 26.6 outline at the glyph origin and the 26.6
     # horizontal advance (what FT_Load_Glyph leaves in the slot).
+    # `hint: true` runs the ported Adobe hinting engine (pshints/psblues,
+    # no stem darkening — the FT 2.7+ default): the interpreter renders
+    # directly into 26.6 device space, so no matrix/scale pass follows.
+    # Non-identity FontMatrix subfonts fall back to the unhinted path
+    # (cffgload applies the matrix around the engine; not ported yet).
     def load_glyph(gid : Int32, hint : Bool = false) : TT::LoadedGlyph
       builder = Builder.new
       subfont = @cff.subfont_for(gid)
@@ -66,10 +74,23 @@ module CFF
         end
       end
 
+      identity_matrix = subfont.matrix_xx == 0x1_0000 &&
+                        subfont.matrix_yy == 0x1_0000 &&
+                        subfont.matrix_xy == 0 && subfont.matrix_yx == 0 &&
+                        subfont.offset_x == 0 && subfont.offset_y == 0
+      hinted = hint && identity_matrix
+
       glyph_width = 0
       begin
         if entry = @cff.charstring(gid)
-          interp = Interpreter.new(@cff, builder, subfont)
+          if hinted
+            # cf2_getScaleAndHintFlag: (x_scale + 32) / 64 — the Adobe
+            # engine then emits 26.6 device space directly.
+            hint_scale = (x_scale &+ 32) // 64
+            interp = Interpreter.new(@cff, builder, subfont, true, hint_scale)
+          else
+            interp = Interpreter.new(@cff, builder, subfont)
+          end
           glyph_width = interp.run(entry[0], entry[1], false, 0_i64, 0_i64)
           # cf2_outline_close: one final close of the last contour (the
           # earlier ones are closed by the next subpath's moveTo).
@@ -91,6 +112,15 @@ module CFF
 
       xs = builder.xs
       ys = builder.ys
+
+      if hinted
+        # The outline is already in 26.6 device space; the advance is
+        # grid-fitted like the hinted slot (ft_glyphslot_grid_fit).
+        advance = Fixed.mulfix(advance, x_scale)
+        advance = (advance &+ 32) & ~63_i64
+        return TT::LoadedGlyph.new(xs, ys, builder.tags, builder.contours,
+                                   advance)
+      end
 
       # Apply the font matrix, if any.
       if subfont.matrix_xx != 0x1_0000 || subfont.matrix_yy != 0x1_0000 ||

@@ -17,6 +17,7 @@
 # works on 16.16 Int32 values stored in Int64 with explicit i32 wraps.
 
 require "./cffload"
+require "./cffhints"
 
 module CFF
   class InterpError < Exception
@@ -115,11 +116,50 @@ module CFF
     end
   end
 
-  # The unhinted/undarkened cf2_GlyphPath: coordinates are CS 16.16,
-  # the map to DS is FT_MulFix by the unity scale 1/64 (0x0400).
+  # The cf2_GlyphPath: coordinates are CS 16.16, the map to DS is
+  # FT_MulFix by the unity scale 1/64 (0x0400) in unhinted mode, or a
+  # real hint map per subpath/hint-substitution zone in hinted mode.
+  # Darkening (offsets, intersections, winding) is not part of this
+  # port: with darken == FALSE the offsets are zero and the joins are
+  # contiguous, so the intersection machinery never fires.
   class GlyphPath
-    def initialize(@builder : Builder)
-      @scale = 0x0400_i64 # innerTransform.a == .d, .b == .c == 0
+    getter hint_scale : Int64 # the hint map scale (innerTransform.d)
+    getter initial_hint_map : HintMap?
+    getter blues : Blues?
+
+    @scale_x : Int64
+    @hinted : Bool
+    @hint_map : HintMap?
+    @first_hint_map : HintMap?
+    @mask : HintMask?
+    @h_stems : Array(StemHint)?
+    @v_stems : Array(StemHint)?
+    @blues : Blues?
+    @hint_origin_y : Int64 = 0_i64
+
+    def initialize(@builder : Builder, hinted : Bool = false,
+                   scale_x : Int64 = 0x0400_i64, scale_y : Int64 = 0x0400_i64,
+                   h_stems : Array(StemHint)? = nil,
+                   v_stems : Array(StemHint)? = nil,
+                   mask : HintMask? = nil, blues : Blues? = nil,
+                   hint_origin_y : Int64 = 0_i64)
+      @hinted = hinted
+      @scale_x = scale_x
+      @scale_y = scale_y
+      @hint_scale = scale_y
+      @h_stems = h_stems
+      @v_stems = v_stems
+      @mask = mask
+      @blues = blues
+      @hint_origin_y = hint_origin_y
+      @scale = scale_y
+      if hinted
+        # One initial map shared by the working, first and counter maps
+        # (cf2_glyphpath_init links them all to initialHintMap).
+        @initial_hint_map = HintMap.new(scale_y)
+        @hint_map = HintMap.new(scale_y, @initial_hint_map)
+        @first_hint_map = HintMap.new(scale_y, @initial_hint_map)
+      end
       @start = {0_i64, 0_i64}
       @current_cs = {0_i64, 0_i64}
       @current_ds = {0_i64, 0_i64}
@@ -134,7 +174,28 @@ module CFF
       @path_is_open = false
       @path_is_closing = false
       @elem_is_queued = false
+      @hintmap_valid = !hinted
+    end
+
+    def reset_hint_state(h_stems : Array(StemHint), v_stems : Array(StemHint),
+                         mask : HintMask, blues : Blues,
+                         hint_origin_y : Int64) : Nil
+      return unless @hinted
+      @h_stems = h_stems
+      @v_stems = v_stems
+      @mask = mask
+      @blues = blues
+      @hint_origin_y = hint_origin_y
+      @initial_hint_map = HintMap.new(@scale_y)
+      @hint_map = HintMap.new(@scale_y, @initial_hint_map)
+      @first_hint_map = HintMap.new(@scale_y, @initial_hint_map)
       @hintmap_valid = false
+      @move_is_pending = true
+      @path_is_open = false
+      @path_is_closing = false
+      @elem_is_queued = false
+      @current_cs = {0_i64, 0_i64}
+      @start = {0_i64, 0_i64}
     end
 
     def move_to(x : Int64, y : Int64) : Nil
@@ -142,11 +203,22 @@ module CFF
       @start = {x, y}
       @current_cs = {x, y}
       @move_is_pending = true
+      if (hm = @hint_map) && (m = @mask)
+        hm.build(@h_stems.not_nil!, @v_stems.not_nil!, m,
+                 @hint_origin_y, false, @blues.not_nil!) \
+          unless hm.valid && !m.is_new
+        @first_hint_map.not_nil!.copy_from(hm)
+      end
       @hintmap_valid = true # moveTo builds the hint map
     end
 
     def line_to(x : Int64, y : Int64) : Nil
-      return if @current_cs == {x, y} # zero-length line, same hint map
+      new_hint_map = false
+      if (m = @mask)
+        new_hint_map = m.is_new && !@path_is_closing
+      end
+      # Ignore zero-length lines when the hint map is unchanged.
+      return if @current_cs == {x, y} && !new_hint_map
 
       if @move_is_pending
         push_move(@current_cs)
@@ -162,6 +234,11 @@ module CFF
       @prev_p0 = @current_cs
       @prev_p1 = {x, y}
       @current_cs = {x, y}
+
+      if new_hint_map && (hm = @hint_map) && (m = @mask)
+        hm.build(@h_stems.not_nil!, @v_stems.not_nil!, m,
+                 @hint_origin_y, false, @blues.not_nil!)
+      end
     end
 
     def curve_to(x1, y1, x2, y2, x3, y3) : Nil
@@ -181,6 +258,11 @@ module CFF
       @prev_p2 = {x2, y2}
       @prev_p3 = {x3, y3}
       @current_cs = {x3, y3}
+
+      if (hm = @hint_map) && (m = @mask) && m.is_new
+        hm.build(@h_stems.not_nil!, @v_stems.not_nil!, m,
+                 @hint_origin_y, false, @blues.not_nil!)
+      end
     end
 
     def close_open_path : Nil
@@ -199,8 +281,15 @@ module CFF
       @elem_is_queued = false
     end
 
-    private def hint_point(x : Int64, y : Int64) : {Int64, Int64}
-      {Fixed.mulfix(x, @scale), Fixed.mulfix(y, @scale)}
+    private def hint_point(x : Int64, y : Int64,
+                           map : HintMap? = nil) : {Int64, Int64}
+      if hm = map
+        # cf2_glyphpath_hintPoint with outer transform identity and a
+        # zero fractional translation.
+        {Fixed.mulfix(@scale_x, x), hm.map(y)}
+      else
+        {Fixed.mulfix(x, @scale), Fixed.mulfix(y, @scale)}
+      end
     end
 
     private def push_move(start : {Int64, Int64}) : Nil
@@ -208,7 +297,7 @@ module CFF
         # First subpath missing a moveto: synthesize one at `start'.
         move_to(@start[0], @start[1])
       end
-      pt1 = hint_point(start[0], start[1])
+      pt1 = hint_point(start[0], start[1], @hint_map)
       @builder.move_to(pt1[0], pt1[1])
       @current_ds = pt1
       @offset_start0 = start
@@ -219,19 +308,19 @@ module CFF
       # so the join-intersection machinery of cf2_glyphpath_pushPrevElem
       # never fires (prevP1 == nextP0 and useIntersection stays FALSE).
       pt0 = @current_ds
+      first_map = close ? @first_hint_map : nil
 
       case @prev_op
       when :line
-        pt1 = hint_point(@prev_p1[0], @prev_p1[1])
-        # `close' would use the first hint map — identical at unity scale.
+        pt1 = hint_point(@prev_p1[0], @prev_p1[1], first_map || @hint_map)
         if pt0 != pt1
           @builder.line_to(pt0[0], pt0[1], pt1[0], pt1[1])
           @current_ds = pt1
         end
       when :cube
-        pt1 = hint_point(@prev_p1[0], @prev_p1[1])
-        pt2 = hint_point(@prev_p2[0], @prev_p2[1])
-        pt3 = hint_point(@prev_p3[0], @prev_p3[1])
+        pt1 = hint_point(@prev_p1[0], @prev_p1[1], @hint_map)
+        pt2 = hint_point(@prev_p2[0], @prev_p2[1], @hint_map)
+        pt3 = hint_point(@prev_p3[0], @prev_p3[1], @hint_map)
         @builder.cube_to(pt0[0], pt0[1], pt1[0], pt1[1],
                          pt2[0], pt2[1], pt3[0], pt3[1])
         @current_ds = pt3
@@ -239,7 +328,7 @@ module CFF
 
       # Connecting line from the end of the previous element to nextP0
       # (always evaluated when closing; zero-length otherwise).
-      pt1c = hint_point(next_p0[0], next_p0[1])
+      pt1c = hint_point(next_p0[0], next_p0[1], first_map || @hint_map)
       if pt1c != @current_ds
         @builder.line_to(@current_ds[0], @current_ds[1], pt1c[0], pt1c[1])
         @current_ds = pt1c
@@ -431,6 +520,13 @@ module CFF
     @v_stems : Int32 = 0
     @hintmask_valid : Bool = false
     @instruction_limit : UInt32 = 20_000_000_u32
+    # Hinted engine state (cff_interpT2CharString's hint objects).
+    @hinted : Bool = false
+    @hint_scale : Int64 = 0x0400_i64
+    @h_stem_hints : Array(StemHint) = [] of StemHint
+    @v_stem_hints : Array(StemHint) = [] of StemHint
+    @hint_mask : HintMask = HintMask.new
+    @hint_origin_y : Int64 = 0_i64
 
     private def add32(a : Int64, b : Int64) : Int64
       CFF.add32(a, b)
@@ -440,11 +536,21 @@ module CFF
       CFF.sub32(a, b)
     end
 
-    def initialize(font : Font, builder : Builder, @subfont : SubFont)
+    def initialize(font : Font, builder : Builder, @subfont : SubFont,
+                   hinted : Bool = false, scale : Int64 = 0x0400_i64)
       @font = font
       @data = font.data
       @builder = builder
-      @path = GlyphPath.new(builder)
+      @hinted = hinted
+      @hint_scale = scale
+      if hinted
+        @path = GlyphPath.new(builder, hinted: true, scale_x: scale,
+                              scale_y: scale, h_stems: @h_stem_hints,
+                              v_stems: @v_stem_hints, mask: @hint_mask,
+                              blues: Blues.new(@subfont, scale))
+      else
+        @path = GlyphPath.new(builder)
+      end
       @stack = OpStack.new
       @storage = Array(Int64).new(32, 0_i64)
       @buffers = [] of Buf
@@ -462,6 +568,13 @@ module CFF
       @h_stems = 0
       @v_stems = 0
       @hintmask_valid = false
+      if @hinted
+        @h_stem_hints.clear
+        @v_stem_hints.clear
+        @hint_mask = HintMask.new
+        @path.reset_hint_state(@h_stem_hints, @v_stem_hints, @hint_mask,
+                               Blues.new(@subfont, @path.hint_scale), cur_y)
+      end
 
       interpret(doing_seac)
       # cf2_setGlyphWidth: *decoder->glyph_width = cf2_fixedToInt(width)
@@ -505,13 +618,13 @@ module CFF
           if @hintmask_valid
             # never add hints after the mask is computed
           else
-            @h_stems = do_stems(@h_stems)
+            @h_stems = do_stems(@h_stems, @hinted ? @h_stem_hints : nil)
           end
         when 3, 23 # vstem, vstemhm
           if @hintmask_valid
             # invalid
           else
-            @v_stems = do_stems(@v_stems)
+            @v_stems = do_stems(@v_stems, @hinted ? @v_stem_hints : nil)
           end
         when 4 # vmoveto
           if @stack.size > 1 && !@have_width
@@ -622,12 +735,27 @@ module CFF
           if @stack.size > 1 && @hintmask_valid
             # invalid hint mask: do not consume the mask bytes
           else
-            # Implied vstemhm: parse the width, count the stems.
-            @v_stems = do_stems(@v_stems)
+            # Implied vstemhm: parse the width, collect the stems.
+            @v_stems = do_stems(@v_stems, @hinted ? @v_stem_hints : nil)
             mask_len = (@h_stems + @v_stems + 7) // 8
             raise InterpError.new("too many hints") if @h_stems + @v_stems > 96
             raise InterpError.new("hint mask past end") if buf.pos + mask_len > buf.end_pos
-            buf.skip(mask_len)
+            if @hinted
+              if op1 == 19
+                @hint_mask.read(buf, @h_stems + @v_stems)
+              else
+                # cntrmask: read into a separate mask, then build a throw-
+                # away hint map to place and lock the counters' stems.
+                counter_mask = HintMask.new
+                counter_mask.read(buf, @h_stems + @v_stems)
+                counter_map = HintMap.new(@path.hint_scale)
+                counter_map.initial_map = @path.initial_hint_map
+                counter_map.build(@h_stem_hints, @v_stem_hints, counter_mask,
+                                  0_i64, false, @path.blues.not_nil!)
+              end
+            else
+              buf.skip(mask_len)
+            end
             # Only the hintmask operator validates the (real) mask; a
             # cntrmask reads into a separate struct (cf2_hintmask_read on
             # counterMask), leaving hintMask itself invalid.
@@ -961,9 +1089,10 @@ module CFF
       end
     end
 
-    # cf2_doStems: width parsing plus stem counting (unhinted keeps no
-    # stem list, only the counts for the hint masks).
-    private def do_stems(stems : Int32) : Int32
+    # cf2_doStems: width parsing plus stem hint collection — unhinted
+    # mode only keeps the counts (for the mask byte lengths), hinted
+    # mode pushes real CF2_StemHint records with delta positions.
+    private def do_stems(stems : Int32, into : Array(StemHint)?) : Int32
       count = @stack.size
       has_width_arg = (count & 1) == 1
 
@@ -973,8 +1102,12 @@ module CFF
       @have_width = true
 
       added = 0
+      position = 0_i64
       i = has_width_arg ? 1 : 0
-      while i < count
+      while i + 1 < count
+        min = position = add32(position, @stack.get_real(i))
+        max = position = add32(position, @stack.get_real(i + 1))
+        into << StemHint.new(min, max) if into
         added += 1
         i += 2
       end
@@ -1048,7 +1181,7 @@ module CFF
       raise InterpError.new("seac component charstring") unless entry
 
       x0, y0 = @cur_x, @cur_y
-      sub = Interpreter.new(@font, @builder, @subfont)
+      sub = Interpreter.new(@font, @builder, @subfont, @hinted, @hint_scale)
       sub.run(entry[0], entry[1], true, x0, y0)
       # The component's glyphpath is shared through @builder; the accent
       # keeps its translation, the base starts at the origin (0, 0).

@@ -9,8 +9,9 @@
 #     binary-coded decimal reals (`cff_parse_real' verbatim, including
 #     the scaling-exponent reconciliation), `cff_parse_font_matrix'.
 #
-# Bare CFF (own encoding/charset charmaps), CFF2, MM/blend operators and
-# the blue/hinting private-dict entries are intentionally not parsed.
+# Bare CFF (own encoding/charset charmaps), CFF2, MM/blend operators
+# are intentionally not parsed; the blue/hinting private-dict entries
+# are parsed for the Adobe hinting engine (cffhints.cr).
 
 module CFF
   class ParseError < Exception
@@ -297,6 +298,31 @@ module CFF
     end
   end
 
+  # cff_kind_delta (cffparse.c): a cumulative delta-decoded integer
+  # array, truncated to `max' entries before decoding.
+  def self.parse_delta_num(d : Bytes, args : Array(Int32), limit : Int32,
+                           max : Int32) : Array(Int64)
+    out = [] of Int64
+    val = 0_i64
+    args.first(max).each do |p|
+      val = val &+ parse_num(d, p, limit)
+      out << val
+    end
+    out
+  end
+
+  # cff_kind_delta_fixed: the same with 16.16 operands (blue arrays).
+  def self.parse_delta_fixed(d : Bytes, args : Array(Int32), limit : Int32,
+                             max : Int32) : Array(Int64)
+    out = [] of Int64
+    val = 0_i64
+    args.first(max).each do |p|
+      val = val &+ parse_fixed(d, p, limit)
+      out << val
+    end
+    out
+  end
+
   # cff_parse_fixed_dynamic: {value 16.16, decimal scaling}.
   def self.parse_fixed_dynamic(d : Bytes, p : Int32, limit : Int32) : {Int64, Int64}
     return parse_real(d, p, limit, 0, true) if d[p] == 30
@@ -397,6 +423,22 @@ module CFF
     property nominal_width : Int64 = 0
     property initial_random_seed : Int64 = 0
     property local_subrs : Index?
+
+    # Hinting entries (cfftoken.h CFF_FIELD_*). Blue arrays are stored
+    # delta-decoded in 16.16; BlueScale is value*1000 in 16.16 (the
+    # "1000 times" convention of cffload.c); the rest are integers.
+    property blue_values : Array(Int64) = [] of Int64      # max 14
+    property other_blues : Array(Int64) = [] of Int64      # max 10
+    property family_blues : Array(Int64) = [] of Int64     # max 14
+    property family_other_blues : Array(Int64) = [] of Int64 # max 10
+    property blue_scale : Int64 = 2_596_928_i64 # (FT_Fixed)(0.039625*0x10000*1000)
+    property blue_shift : Int64 = 7
+    property blue_fuzz : Int64 = 1
+    property std_hw : Int64 = 0 # StdHW (standard_width)
+    property std_vw : Int64 = 0 # StdVW (standard_height)
+    property stem_snap_h : Array(Int64) = [] of Int64 # max 13
+    property stem_snap_v : Array(Int64) = [] of Int64 # max 13
+    property language_group : Int64 = 0
 
     # The RNG state (xorshift, psobjs.c cff_random); seeded from the
     # private dict's InitialRandomSeed (deterministic, unlike the C
@@ -507,7 +549,45 @@ module CFF
           @nominal_width = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
         when 0x113 # initialRandomSeed
           @initial_random_seed = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
+        when 6 # BlueValues (delta, 16.16, max 14)
+          @blue_values = CFF.parse_delta_fixed(d, args, start + @private_size.to_i32, 14)
+        when 7 # OtherBlues (max 10)
+          @other_blues = CFF.parse_delta_fixed(d, args, start + @private_size.to_i32, 10)
+        when 8 # FamilyBlues (max 14)
+          @family_blues = CFF.parse_delta_fixed(d, args, start + @private_size.to_i32, 14)
+        when 9 # FamilyOtherBlues (max 10)
+          @family_other_blues = CFF.parse_delta_fixed(d, args, start + @private_size.to_i32, 10)
+        when 0x109 # BlueScale (real, stored *1000)
+          if args.size >= 1
+            @blue_scale = CFF.parse_fixed(d, args[0], start + @private_size.to_i32) &* 1000
+          end
+        when 0x10A # BlueShift
+          @blue_shift = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
+        when 0x10B # BlueFuzz
+          @blue_fuzz = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
+        when 10 # StdHW
+          @std_hw = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
+        when 11 # StdVW
+          @std_vw = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
+        when 0x10C # StemSnapH (delta, integers, max 13)
+          @stem_snap_h = CFF.parse_delta_num(d, args, start + @private_size.to_i32, 13)
+        when 0x10D # StemSnapV
+          @stem_snap_v = CFF.parse_delta_num(d, args, start + @private_size.to_i32, 13)
+        when 0x111 # LanguageGroup
+          @language_group = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
         end
+      end
+
+      # cff_load_private_dict sanitization: an odd BlueValues count
+      # drops the last entry; BlueShift/BlueFuzz out of [0,1000] reset.
+      unless @blue_values.empty? || @blue_values.size.even?
+        @blue_values.pop
+      end
+      if @blue_shift > 1000 || @blue_shift < 0
+        @blue_shift = 7
+      end
+      if @blue_fuzz > 1000 || @blue_fuzz < 0
+        @blue_fuzz = 1
       end
 
       # Sanitize the seed exactly like cff_load_private_dict.

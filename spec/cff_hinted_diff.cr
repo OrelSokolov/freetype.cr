@@ -1,0 +1,85 @@
+# Hinted oracle diff for the CFF pipeline: our `CFF::Face#load_glyph(gid,
+# hint: true)` outline (26.6) and horizontal advance must match the system
+# FreeType loaded with FT_LOAD_DEFAULT | FT_LOAD_NO_BITMAP — the FT
+# default configuration (Adobe engine; stem darkening is OFF by default
+# since FreeType 2.7, which is exactly what this port implements).
+# Point for point, advances included. Corpus/ARGV handling mirrors
+# spec/cff_unhinted_diff.cr.
+
+require "./oracle_lib"
+require "../src/cff/face"
+
+def otf_corpus : Array(String)
+  dirs = {
+    "/usr/share/fonts/opentype/urw-base35",
+    "/usr/share/fonts/opentype/urw-base35/Extra",
+    "/usr/share/texmf/fonts/opentype/public/tex-gyre",
+    "/usr/share/texmf/fonts/opentype/public/lm",
+    "/usr/share/fonts/opentype/texgyre",
+    "/usr/share/fonts/opentype/lm",
+  }
+  files = [] of String
+  dirs.each do |d|
+    Dir.glob("#{d}/*.otf").sort.each { |f| files << f }
+  end
+  files.select { |f| File.exists?(f) }
+end
+
+CORPUS = ARGV.empty? ? otf_corpus : ARGV
+raise "corpus is empty: no OTF fonts found (or pass font paths as ARGV)" \
+  if CORPUS.empty?
+CORPUS.each do |f|
+  raise "corpus font not found: #{f}" unless File.exists?(f)
+end
+SIZES = {12, 13, 16, 24, 37}
+
+lib_ptr = Pointer(Void).null
+err = LibFT.init_free_type(pointerof(lib_ptr))
+raise "FT_Init_FreeType: #{err}" if err != 0
+
+total = 0
+fails = 0
+first_failures = [] of String
+
+CORPUS.each do |path|
+  face = FtFace.new(lib_ptr, path)
+  font = CFF::Face.new(File.read(path).to_slice)
+
+  SIZES.each do |px|
+    LibFT.set_pixel_sizes(face.face, px, px)
+    font.set_pixel_size(px)
+
+    font.num_glyphs.times do |gid|
+      snap = load_outline(face.face, gid, LibFT::FT_LOAD_DEFAULT | LibFT::FT_LOAD_NO_BITMAP)
+      g = font.load_glyph(gid, hint: true)
+
+      total += 1
+      ok = true
+      if snap.nil?
+        ok = g.xs.empty? && g.ys.empty?
+      else
+        ok = g.xs == snap.xs && g.ys == snap.ys &&
+             g.tags == snap.tags && g.contours == snap.contours
+      end
+      adv = face.face.value.glyph.value.advance.x
+      ok = false if adv != g.advance
+      unless ok
+        fails += 1
+        if first_failures.size < 12
+          snap_n = snap ? snap.not_nil!.xs.size : -1
+          first_failures << "#{File.basename(path)} px=#{px} gid=#{gid}: " \
+                            "ours np=#{g.xs.size} ft np=#{snap_n} " \
+                            "adv=#{g.advance} ft_adv=#{adv}"
+        end
+      end
+    end
+  end
+  face.done
+end
+
+LibFT.done_free_type(lib_ptr)
+
+puts "fonts=#{CORPUS.size} glyphs=#{total} fails=#{fails}"
+first_failures.each { |f| puts "  #{f}" }
+puts "RESULT: #{fails == 0 ? "PASS" : "FAIL"}"
+exit(fails == 0 ? 0 : 1)

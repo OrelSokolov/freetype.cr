@@ -73,6 +73,17 @@ render.
   ps_builder outline callbacks from `psobjs.c`. 32-bit wrapping
   arithmetic is carried over explicitly. A tracer is built in
   (`CFF_TRACE=1`, the TT_TRACE counterpart).
+- `src/cff/cffhints.cr` — the Adobe hinting engine: a port of
+  `pshints.c` (CF2_Hint edge expansion with ghost/inverted pairs,
+  the hint map — build/insert with initial-map recomputation, the
+  two-pass optimum pixel positioning of `cf2_hintmap_adjustHints`,
+  the piecewise-linear CS→DS map) and `psblues.c` (blue zones with
+  family flat-edge matching, BlueScale cutoff, overshoot suppression /
+  blue boost, `cf2_blues_capture`, the ideographic em-box heuristic)
+  plus the HintMask object from `psintrp.c`. The hinted GlyphPath
+  (per-subpath/hint-substitution maps, first-map closes) lives in
+  `cffinterp.cr`; stem darkening (offsets, intersections, winding) is
+  out — FT defaults to it off since 2.7.
 - `src/cff/face.cr` — the CFF-flavoured OTF face: a port of
   `cff_slot_load` (cffgload.c) — advance from `hmtx`, FontMatrix →
   translate → FT_MulFix scale in the cffgload.c order — reusing the
@@ -117,7 +128,9 @@ bmp = Ftrender.render_glyph(
 ```
 
 `CFF::Face#load_glyph` returns the same `TT::LoadedGlyph` structure and
-renders through the same `Ftrender` as the TrueType path.
+renders through the same `Ftrender` as the TrueType path. `hint: true`
+(default in FT terms: FT_LOAD_DEFAULT) runs the ported Adobe hinting
+engine — bit-exact against it.
 
 ## Accuracy
 
@@ -145,6 +158,13 @@ specs; the library itself never calls it):
   → bitmap compare) is also 0-diff. The CID path (FDArray/FDSelect) is
   verified on Noto Sans CJK JP (18 subfonts, every one in use):
   327 675 glyphs, 0 diff.
+- **CFF (OTF), hinted (Adobe engine):** the port of `pshints.c`/
+  `psblues.c` (stem hints, hint maps with two-pass optimum positioning,
+  blue zones with family matching, overshoot suppression and the
+  BlueScale cutoff, cntrmask counter maps, ghost/inverted pairs) —
+  **632 875 glyphs / 140 OTF fonts / 12-37 px, 0 diff** against
+  FT_LOAD_DEFAULT (Adobe engine, darkening off — the FT default since
+  2.7), plus the CID font above (327 675 glyphs, 0 diff).
 - **WOFF1:** 222 942 glyphs across 6 fonts (Liberation TTF, Roboto TTF,
   three OTFs and the CID Noto above, all re-wrapped as WOFF1 with
   zlib-compressed tables) — **0 diff** against the system libfreetype
@@ -152,12 +172,14 @@ specs; the library itself never calls it):
 
 ### CFF limitations (honest)
 
-- **Hinting and stem darkening are not ported.** The Adobe engine
-  (`pshints.c`/`psblues.c`, ~4.5k lines of psaux) is not implemented:
-  glyphs always load unhinted, without darkening. Note that stock
-  libfreetype applies stem darkening even under FT_LOAD_NO_HINTING —
-  matching its default output would require that engine (a possible
-  stage B).
+- **Adobe hinting is ported** (`pshints.c`/`psblues.c` and the hint ops
+  of `psintrp.c` — see `src/cff/cffhints.cr`); `load_glyph(gid, hint:
+  true)` reproduces FT_LOAD_DEFAULT bit for bit. **Stem darkening is
+  not ported and intentionally so**: FreeType itself defaults to
+  `no-stem-darkening=TRUE` since 2.7, so the no-darkening output
+  matches stock libfreetype (verified glyph-for-glyph). Enabling
+  darkening via `FT_Property_Set` would diverge. Subfonts with a
+  non-identity FontMatrix still load through the unhinted path.
 - Bare CFF (`.cff` files with their own encoding/charset charmaps),
   CFF2 and WOFF2 wrappers are not parsed — only CFF1 in an SFNT/OTF
   and WOFF1 (which is unwrapped to SFNT transparently).
@@ -279,6 +301,9 @@ increase the review cost of acceptance.
   CFF acceptance diff: outlines (points + tags + contours) and advances
   against FT_LOAD_NO_HINTING with `no-stem-darkening` set via FFI
   (632 875 glyphs across 140 OTF fonts, 0 diff).
+- `crystal run --release spec/cff_hinted_diff.cr [-- fonts...]` — the
+  hinted CFF acceptance diff against FT_LOAD_DEFAULT (Adobe engine,
+  darkening off): 632 875 glyphs across 140 OTF fonts, 0 diff.
 - `crystal run --release spec/bench_render.cr -- [total] [batch]` —
   the performance benchmark (see above); `spec/bench_ffi.cr` — the
   FFI-call-cost microbenchmark; `spec/bench_diff.cr -- [n]` — a

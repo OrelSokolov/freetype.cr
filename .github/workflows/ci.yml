@@ -87,5 +87,8 @@ jobs:
       - name: CFF CID diff vs libfreetype (Noto Sans CJK JP)
         run: crystal run --release --error-trace spec/cff_unhinted_diff.cr -- .cidfont/NotoSansCJKjp-Regular.otf
 
+      - name: CFF hinted diff vs libfreetype (Adobe engine)
+        run: crystal run --release --error-trace spec/cff_hinted_diff.cr
+
       - name: WOFF unwrap diff vs libfreetype
         run: crystal run --release --error-trace spec/woff_unhinted_diff.cr -- .cidfont/NotoSansCJKjp-Regular.otf
