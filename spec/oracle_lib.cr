@@ -20,6 +20,13 @@ lib LibFT
   FT_LOAD_NO_BITMAP  = 0x8
   FT_PIXEL_MODE_GRAY = 2
 
+  # FT_Render_Mode_ (ftimage.h)
+  FT_RENDER_MODE_NORMAL = 0
+  FT_RENDER_MODE_LIGHT  = 1
+  FT_RENDER_MODE_MONO   = 2
+  FT_RENDER_MODE_LCD    = 3
+  FT_RENDER_MODE_LCD_V  = 4
+
   struct Vector
     x : Long
     y : Long
@@ -87,6 +94,7 @@ lib LibFT
   fun get_char_index = FT_Get_Char_Index(face : FaceRec*, char_code : UInt32) : UInt32
   fun load_glyph = FT_Load_Glyph(face : FaceRec*, glyph_index : UInt32,
                                  load_flags : Int32) : Int32
+  fun render_glyph = FT_Render_Glyph(slot : GlyphSlotRec*, render_mode : Int32) : Int32
   fun done_face = FT_Done_Face(face : FaceRec*) : Int32
   fun done_free_type = FT_Done_FreeType(library : Void*) : Int32
 end

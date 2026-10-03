@@ -8,7 +8,9 @@
 rasterization + PNG packing, no FreeType, no FFI (`spec/gen_logo.cr`).*
 
 A self-contained Crystal port of FreeType's font pipeline: the
-`ftgrays.c` anti-aliasing rasterizer, the `ttinterp.c` bytecode-hinting
+`ftgrays.c` anti-aliasing rasterizer (plus the `ftraster.c`
+black-and-white one for FT_RENDER_MODE_MONO and the `ftlcdfil.c` FIR
+filter for LCD), the `ttinterp.c` bytecode-hinting
 VM, the SFNT loading glue and the CFF (Type 2 charstring) glyph loader
 (ported from the FreeType 2.14.3 master snapshot). No dependency on
 libfreetype — or on any other part of FreeType. Given a TTF/OTF and a
@@ -37,10 +39,21 @@ render.
   shifts, C-style truncated division `tdiv`, an exact replica of
   `FT_UDIV`. The cell pool / band bisection is replaced with dynamic
   arrays (area integration is independent of the band split).
-- `src/ftrender.cr` — the `ftsmooth.c`/`ftobjs.c` glue for
-  FT_RENDER_MODE_NORMAL: control box → pixel bbox (floor/ceil as in
-  `ft_glyphslot_preset_bitmap`) → translation → rasterization. The
-  result is an `Ftrender::GlyphBitmap` (top-down 8-bit coverage).
+- `src/ftrender.cr` — the `ftsmooth.c`/`ftobjs.c` rendering glue for all
+  four `FT_Render_Mode`s: control box → pixel bbox (floor/ceil as in
+  `ft_glyphslot_preset_bitmap`) → translation → rasterization. NORMAL
+  renders through `ftgrays`; LCD/LCD_V pad the cbox ±43/64, implode the
+  buffer (x*3 / y*3) and apply the default five-tap FIR filter
+  (`[0x08, 0x4D, 0x56, 0x4D, 0x08]`, ported from `ftlcdfil.c`); MONO
+  goes through `src/ftraster1.cr`. The result is an
+  `Ftrender::GlyphBitmap` (8-bit coverage or 1-bit MSB-first packed,
+  top-down; `pitch` and `mode` fields included).
+- `src/ftraster1.cr` — a port of the `ftraster.c` black-and-white
+  rasterizer (FreeType 2.13.3): profile pool with y-turns, line/Bezier
+  up/down splitting, the two-pass sweep (vertical + horizontal, MSB-first
+  bits) with dropout/stub/smart handling, sub-banding. Used for
+  FT_RENDER_MODE_MONO; honours `FT_OUTLINE_HIGH_PRECISION` (TrueType
+  hinted outlines set it) and the dropout scan-mode flags in tags[0].
 - `src/fttrigon.cr` — a port of `fttrigon.c` (fixed-point trigonometry:
   `FT_Vector_Rotate`, `FT_Vector_Norm_Len`, etc. — needed for
   projections onto arbitrary axes in the bytecode).
@@ -188,6 +201,14 @@ specs; the library itself never calls it):
   `.woff2` files. Covers transformed `glyf'/`loca' (simple, composite,
   empty glyphs, explicit and computed bboxes), transformed `hmtx' and
   short `loca' (indexToLocFormat 0).
+- **MONO/LCD/LCD_V rendering:** **749 370 glyph bitmaps** across the
+  DejaVu + Liberation corpus (38 fonts, mono/lcd/lcdv, 13/24 px) —
+  **0 diff** against `FT_Render_Glyph` of the system libfreetype
+  (bit-exact buffers, dimensions and offsets). The mono mode runs the
+  ported `ftraster.c`; LCD/LCD_V go through the ftgrays path with the
+  default FIR filter. NB: pixel-exact LCD output requires a libfreetype
+  built with subpixel rendering enabled (`SUBPIXEL_RENDERING`), as the
+  distro build here is.
 - **TTC/OTC collections:** all **30 faces** of the system Noto CJK
   collections (NotoSansCJK/NotoSerifCJK Regular+Bold, CFF-flavoured;
   10+10 Sans + 5+5 Serif faces) loaded through
@@ -343,6 +364,11 @@ increase the review cost of acceptance.
   collection acceptance diff: every face of a `.ttc'/`.otc' (default
   corpus: the system Noto CJK collections) diffed against the system
   libfreetype opened with the same face index, hinted and unhinted.
+- `crystal run --release spec/mono_lcd_diff.cr [-- fonts...]` — the
+  MONO/LCD/LCD_V acceptance diff: every glyph of the corpus rendered
+  through `Ftrender.render_glyph` in each mode and compared bit-for-bit
+  with `FT_Render_Glyph` (749 370 bitmaps, 0 diff). LCD modes expect the
+  oracle libfreetype to be built with subpixel rendering.
 - `crystal run --release spec/bench_render.cr -- [total] [batch]` —
   the performance benchmark (see above); `spec/bench_ffi.cr` — the
   FFI-call-cost microbenchmark; `spec/bench_diff.cr -- [n]` — a
@@ -364,9 +390,11 @@ increase the review cost of acceptance.
   `/2` truncating toward zero) round on shifted coordinates — the port
   applies the shift when reading points in `decompose`, not when
   upscaling. Found by debugging; kept as an invariant.
-- Rendering follows FT_RENDER_MODE_NORMAL only: overlap handling
-  (FT_OUTLINE_OVERLAP) and the LCD paths are not ported — glyph baking
-  uses the plain NORMAL path.
+- Rendering covers all four `FT_Render_Mode`s (NORMAL via ftgrays, MONO
+  via ftraster1, LCD/LCD_V with the default FIR filter). Overlap
+  handling (FT_OUTLINE_OVERLAP) is not ported. Pixel-exact LCD/LCD_V
+  output assumes subpixel rendering is enabled in the reference
+  libfreetype (`SUBPIXEL_RENDERING`); distro builds usually have it.
 - Square pixel sizes, grayscale (non-mono) rendering, non-tricky fonts
   — the scope the hint glue is specialized to (FT_LOAD_DEFAULT with
   v40 subpixel-hinting-minimal).

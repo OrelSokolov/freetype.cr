@@ -46,6 +46,10 @@ jobs:
             https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf
           ls -la .cidfont/
 
+      # NB: CFLAGS adds FT_CONFIG_OPTION_SUBPIXEL_RENDERING: without it
+      # the tarball's LCD/LCD_V render skips the FIR filter and
+      # spec/mono_lcd_diff.cr (which matches the filter bit-for-bit)
+      # would fail. MONO output is identical either way (verified).
       - name: Build FreeType 2.13.3 oracle
         run: |
           set -euxo pipefail
@@ -55,7 +59,8 @@ jobs:
           (
             cd freetype-2.13.3
             ./configure --prefix=/usr/local \
-              --with-harfbuzz=no --with-brotli=no --with-png=no --with-bzip2=no
+              --with-harfbuzz=no --with-brotli=no --with-png=no --with-bzip2=no \
+              CFLAGS="-O2 -DFT_CONFIG_OPTION_SUBPIXEL_RENDERING"
             make -j"$(nproc)"
             sudo make install
           )
@@ -80,6 +85,9 @@ jobs:
 
       - name: Hinted pipeline diff vs libfreetype
         run: crystal run --release --error-trace spec/tt_hinted_diff.cr
+
+      - name: MONO/LCD/LCD_V render diff vs libfreetype
+        run: crystal run --release --error-trace spec/mono_lcd_diff.cr
 
       - name: CFF pipeline diff vs libfreetype (unhinted corpus)
         run: crystal run --release --error-trace spec/cff_unhinted_diff.cr
