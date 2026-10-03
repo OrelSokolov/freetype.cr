@@ -15,16 +15,22 @@ def otf_corpus : Array(String)
     "/usr/share/fonts/opentype/urw-base35/Extra",
     "/usr/share/texmf/fonts/opentype/public/tex-gyre",
     "/usr/share/texmf/fonts/opentype/public/lm",
+    "/usr/share/fonts/opentype/texgyre",
+    "/usr/share/fonts/opentype/lm",
   }
   files = [] of String
   dirs.each do |d|
     Dir.glob("#{d}/*.otf").sort.each { |f| files << f }
   end
-  # Keep one file per style family at most if the list explodes.
   files.select { |f| File.exists?(f) }
 end
 
-CORPUS = ARGV.empty? ? otf_corpus : ARGV.select { |f| File.exists?(f) }
+CORPUS = ARGV.empty? ? otf_corpus : ARGV
+raise "corpus is empty: no OTF fonts found (or pass font paths as ARGV)" \
+  if CORPUS.empty?
+CORPUS.each do |f|
+  raise "corpus font not found: #{f}" unless File.exists?(f)
+end
 SIZES = {12, 13, 16, 24, 37}
 
 lib_ptr = Pointer(Void).null

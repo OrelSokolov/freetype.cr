@@ -34,7 +34,17 @@ jobs:
         run: |
           sudo apt-get install -y --no-install-recommends \
             fonts-dejavu-core fonts-dejavu-extra fonts-liberation \
-            fonts-roboto-unhinted fonts-noto-core
+            fonts-roboto-unhinted fonts-noto-core \
+            fonts-urw-base35 fonts-texgyre fonts-lmodern
+
+      # CID-keyed CFF font for the FDArray/FDSelect acceptance run
+      # (~16 MB; the URL is the noto-cjk repo's raw OTF).
+      - name: Download Noto Sans CJK JP (CID font)
+        run: |
+          mkdir -p .cidfont
+          curl -sSfL -o .cidfont/NotoSansCJKjp-Regular.otf \
+            https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf
+          ls -la .cidfont/
 
       - name: Build FreeType 2.13.3 oracle
         run: |
@@ -70,3 +80,12 @@ jobs:
 
       - name: Hinted pipeline diff vs libfreetype
         run: crystal run --release --error-trace spec/tt_hinted_diff.cr
+
+      - name: CFF pipeline diff vs libfreetype (unhinted corpus)
+        run: crystal run --release --error-trace spec/cff_unhinted_diff.cr
+
+      - name: CFF CID diff vs libfreetype (Noto Sans CJK JP)
+        run: crystal run --release --error-trace spec/cff_unhinted_diff.cr -- .cidfont/NotoSansCJKjp-Regular.otf
+
+      - name: WOFF unwrap diff vs libfreetype
+        run: crystal run --release --error-trace spec/woff_unhinted_diff.cr -- .cidfont/NotoSansCJKjp-Regular.otf
