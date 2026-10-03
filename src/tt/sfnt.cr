@@ -10,7 +10,12 @@
 #     `kern' (legacy format 0) for codepoint lookup and kerning.
 #
 # Only what the pipeline needs is parsed; variations (fvar/gvar), embedded
-# bitmaps and hdmx are intentionally out of scope.
+# bitmaps and hdmx are intentionally out of scope. WOFF1 wrappers are
+# unwrapped into a plain SFNT before parsing (see `TT.unwrap_woff');
+# WOFF2 (brotli) is out of scope.
+
+require "compress/zlib"
+require "io/memory"
 
 module TT
   # Composite glyph flags (ttgload.c).
@@ -202,6 +207,91 @@ module TT
     end
   end
 
+  # Unwrap a WOFF1 wrapper into a plain SFNT buffer (the port of
+  # FreeType's `woff_open_font', sfnt/wofffnt.c): each table is either
+  # stored raw (compLength == origLength) or zlib-compressed; the
+  # result is a reconstructed SFNT with the original flavor, a fresh
+  # table directory and the tables re-padded to 4-byte alignment.
+  # Non-WOFF input is returned as-is. WOFF2 (brotli) is not supported.
+  def self.unwrap_woff(data : Bytes) : Bytes
+    return data unless data.size >= 44 &&
+                       data[0] == 0x77 && data[1] == 0x4F &&
+                       data[2] == 0x46 && data[3] == 0x46 # 'wOFF'
+
+    length = ru32(data, 8)
+    raise ParseError.new("WOFF length field out of bounds") if length != data.size
+    num_tables = ru16(data, 12)
+    raise ParseError.new("WOFF reserved field must be 0") unless ru16(data, 14) == 0
+    raise ParseError.new("WOFF table directory out of bounds") if 44 + 20*num_tables > data.size
+
+    entries = Array({Bytes, Int32, Int32, Int32, UInt32}).new(num_tables)
+    sfnt_size = 12 + 16*num_tables
+    num_tables.times do |i|
+      off = 44 + 20*i
+      tag = data[off, 4]
+      table_off = ru32(data, off + 4)
+      comp_len = ru32(data, off + 8)
+      orig_len = ru32(data, off + 12)
+      checksum = ru32(data, off + 16)
+      raise ParseError.new("WOFF table out of bounds") if comp_len > orig_len ||
+        table_off + comp_len > data.size
+      entries << {tag, table_off.to_i32, comp_len.to_i32, orig_len.to_i32, checksum}
+      sfnt_size += (orig_len + 3) &~ 3
+    end
+
+    sfnt = Bytes.new(sfnt_size, 0)
+    flavor = ru32(data, 4)
+    w32(sfnt, 0, flavor)
+    w16(sfnt, 4, num_tables)
+    entry_selector = num_tables.bit_length - 1 # floor(log2)
+    search_range = 16 << entry_selector
+    w16(sfnt, 6, search_range)
+    w16(sfnt, 8, entry_selector)
+    w16(sfnt, 10, 16*num_tables - search_range)
+
+    dir_off = 12
+    data_off = 12 + 16*num_tables
+    entries.each do |tag, table_off, comp_len, orig_len, checksum|
+      tag.copy_to(sfnt[dir_off, 4])
+      w32(sfnt, dir_off + 4, checksum)
+      w32(sfnt, dir_off + 8, data_off)
+      w32(sfnt, dir_off + 12, orig_len)
+
+      src = data[table_off, comp_len]
+      if comp_len == orig_len
+        src.copy_to(sfnt[data_off, orig_len])
+      else
+        io = IO::Memory.new(src)
+        reader = Compress::Zlib::Reader.new(io)
+        reader.read_fully(sfnt[data_off, orig_len])
+      end
+      data_off += (orig_len + 3) &~ 3
+      dir_off += 16
+    end
+    sfnt
+  end
+
+  private def self.ru16(d : Bytes, off : Int32) : UInt16
+    (d[off].to_u16 << 8) | d[off + 1]
+  end
+
+  private def self.ru32(d : Bytes, off : Int32) : UInt32
+    (d[off].to_u32 << 24) | (d[off + 1].to_u32 << 16) |
+      (d[off + 2].to_u32 << 8) | d[off + 3]
+  end
+
+  private def self.w16(d : Bytes, off : Int32, v : Int32) : Nil
+    d[off] = (v >> 8).to_u8!
+    d[off + 1] = v.to_u8!
+  end
+
+  private def self.w32(d : Bytes, off : Int32, v : UInt32 | Int32) : Nil
+    d[off] = (v >> 24).to_u8!
+    d[off + 1] = (v >> 16).to_u8!
+    d[off + 2] = (v >> 8).to_u8!
+    d[off + 3] = v.to_u8!
+  end
+
   class Font
     getter num_glyphs : Int32
     getter upem : Int32
@@ -241,7 +331,9 @@ module TT
     @cmap12 : Cmap12?
     @kern_tables : Array(Kern0) = [] of Kern0
 
-    def initialize(@data : Bytes)
+    def initialize(data : Bytes)
+      data = TT.unwrap_woff(data)
+      @data = data
       d = @data
       raise ParseError.new("not an SFNT font (too small)") if d.size < 12
 

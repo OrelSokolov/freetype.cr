@@ -46,7 +46,10 @@ render.
   projections onto arbitrary axes in the bytecode).
 - `src/tt/sfnt.cr` — a minimal SFNT parser: head, maxp, hhea, hmtx,
   cmap (formats 4 and 12), loca, glyf, cvt, fpgm, prep, gasp, kern.
-  Only what loading outlines and hinting need.
+  Only what loading outlines and hinting need. WOFF1 wrappers are
+  unwrapped into a plain SFNT before parsing (the `woff_open_font'
+  approach, zlib via the Crystal stdlib) — `TT::Font`/`CFF::Face`
+  accept `.woff` buffers directly; WOFF2 (brotli) is out of scope.
 - `src/tt/loader.cr` — a port of the hint glue from `ttgload.c`/
   `ttobjs.c`: scaling, `exec.run_fpgm`/`run_prep` (CVT in 26.6, as in
   C), `backward_compatibility`, simple and composite glyph loading,
@@ -139,7 +142,13 @@ specs; the library itself never calls it):
   FT_LOAD_NO_HINTING and `no-stem-darkening=TRUE` (the property is set
   through FFI in the spec; the library itself assumes darkening is
   off). A render smoke test (3 fonts × 16/24 px, full load → rasterize
-  → bitmap compare) is also 0-diff.
+  → bitmap compare) is also 0-diff. The CID path (FDArray/FDSelect) is
+  verified on Noto Sans CJK JP (18 subfonts, every one in use):
+  327 675 glyphs, 0 diff.
+- **WOFF1:** 222 942 glyphs across 6 fonts (Liberation TTF, Roboto TTF,
+  three OTFs and the CID Noto above, all re-wrapped as WOFF1 with
+  zlib-compressed tables) — **0 diff** against the system libfreetype
+  loading the same `.woff` files.
 
 ### CFF limitations (honest)
 
@@ -150,11 +159,11 @@ specs; the library itself never calls it):
   matching its default output would require that engine (a possible
   stage B).
 - Bare CFF (`.cff` files with their own encoding/charset charmaps),
-  CFF2 and WOFF/WOFF2 wrappers are not parsed — only CFF1 inside an
-  SFNT/OTF.
-- The CID path (FDArray/FDSelect subfonts) is written following the C
-  but the corpus contains no CID-keyed font, so it is unverified
-  against the oracle.
+  CFF2 and WOFF2 wrappers are not parsed — only CFF1 in an SFNT/OTF
+  and WOFF1 (which is unwrapped to SFNT transparently).
+- CID (FDArray/FDSelect) is implemented and oracle-verified on
+  Noto Sans CJK JP; other CID fonts passed through the same code path,
+  but that is the only CID font in the acceptance corpus.
 - The `random` operator seed is deterministic (FT's
   InitialRandomSeed); FreeType derives the default seed from a memory
   address, so glyphs using `random` may differ in the low bits of

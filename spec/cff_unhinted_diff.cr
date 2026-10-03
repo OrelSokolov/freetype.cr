@@ -24,7 +24,7 @@ def otf_corpus : Array(String)
   files.select { |f| File.exists?(f) }
 end
 
-CORPUS = otf_corpus
+CORPUS = ARGV.empty? ? otf_corpus : ARGV.select { |f| File.exists?(f) }
 SIZES = {12, 13, 16, 24, 37}
 
 lib_ptr = Pointer(Void).null
