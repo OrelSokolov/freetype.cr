@@ -20,13 +20,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Refresh the apt index first: install-crystal apt-installs its
+      # own dev deps, and the runner image's cached index can be stale
+      # enough that the mirrored debs 404.
+      - name: Update apt index
+        run: sudo apt-get update
+
       - uses: crystal-lang/install-crystal@v1
         with:
           crystal: latest
 
       - name: Install fonts
         run: |
-          sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             fonts-dejavu-core fonts-dejavu-extra fonts-liberation \
             fonts-roboto-unhinted fonts-noto-core
