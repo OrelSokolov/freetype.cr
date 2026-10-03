@@ -229,6 +229,8 @@ module TT
     getter prep : Bytes
     getter ascender : Int32 = 0   # FT_Face->ascender (see the selection below)
     getter descender : Int32 = 0 # FT_Face->descender, negative
+    # Raw 'CFF ' table for CFF-flavoured OTF (empty for TrueType outlines).
+    getter cff_table : Bytes = Bytes.new(0)
 
     @data : Bytes
     @glyf : Bytes = Bytes.new(0)
@@ -315,16 +317,19 @@ module TT
         @typo_ascender = @typo_descender = 0
       end
 
-      # TrueType outlines only: CFF-flavoured OTF (no glyf/loca, 'CFF '
-      # table) and bitmap-only fonts (CBDT/sbix/CBLC) belong to other
-      # FreeType drivers and are out of scope here — reject them up front
-      # instead of crashing on an empty `loca' later.
-      unless tables.has_key?("glyf") && tables.has_key?("loca")
-        raise ParseError.new("no TrueType outlines " \
-          "(missing 'glyf'/'loca'; CFF or bitmap-only font)")
+      # CFF-flavoured OTF carries no glyf/loca: hand the raw 'CFF ' table
+      # to the CFF pipeline (src/cff) and keep the SFNT side (cmap/hmtx/
+      # head) working for it. Bitmap-only fonts (CBDT/sbix/CBLC) stay out
+      # of scope — reject them up front as before.
+      if cff_entry = tables["CFF "]?
+        @cff_table = slice(tables, "CFF ")
+      elsif tables.has_key?("glyf") && tables.has_key?("loca")
+        @loca = slice(tables, "loca")
+        @glyf = slice(tables, "glyf")
+      else
+        raise ParseError.new("no vector outlines " \
+          "(missing 'glyf'/'loca' and 'CFF '; bitmap-only font?)")
       end
-      @loca = slice(tables, "loca")
-      @glyf = slice(tables, "glyf")
 
       cvt_slice = slice(tables, "cvt ")
       @cvt = Array(Int32).new(cvt_slice.size // 2) { |k| i16(cvt_slice, 2*k).to_i32 }

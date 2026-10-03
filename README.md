@@ -1,4 +1,4 @@
-# freetype.cr — TrueType hinting & rasterization in pure Crystal
+# freetype.cr — TrueType & CFF glyph pipeline in pure Crystal
 
 <p align="center">
   <img src="docs/logo.png" alt="freetype.cr logo" width="418">
@@ -7,13 +7,14 @@
 *The logo above was rendered by this library itself — hinted glyph
 rasterization + PNG packing, no FreeType, no FFI (`spec/gen_logo.cr`).*
 
-A self-contained Crystal port of FreeType's TrueType pipeline: the
-`ftgrays.c` anti-aliasing rasterizer, the `ttinterp.c` bytecode-hinting VM
-and the SFNT loading glue (ported from the FreeType 2.14.3 master
-snapshot). No dependency on libfreetype — or on any other part of
-FreeType. Given a TTF and a pixel size, it produces hinted or unhinted
-glyph bitmaps **pixel-for-pixel identical** to what the system
-libfreetype would render.
+A self-contained Crystal port of FreeType's font pipeline: the
+`ftgrays.c` anti-aliasing rasterizer, the `ttinterp.c` bytecode-hinting
+VM, the SFNT loading glue and the CFF (Type 2 charstring) glyph loader
+(ported from the FreeType 2.14.3 master snapshot). No dependency on
+libfreetype — or on any other part of FreeType. Given a TTF/OTF and a
+pixel size, it produces hinted or unhinted glyph bitmaps
+**pixel-for-pixel identical** to what the system libfreetype would
+render.
 
 ## Why
 
@@ -56,6 +57,24 @@ libfreetype would render.
   wrapping arithmetic (`&+ &- &*`), C semantics for division and shifts.
   A tracer is built in (`TT_TRACE=1` — per-instruction VM dump, zero
   cost when the flag is off).
+- `src/cff/cffload.cr` — the CFF table parser: a port of `cffload.c`
+  (header, INDEX structures, charset — needed for seac, FDSelect +
+  FDArray, the font-matrix reconciliation from `cffobjs.c`) and the
+  DICT operand decoding of `cffparse.c` (integers, 16.16 fixed,
+  binary-coded decimal reals verbatim).
+- `src/cff/cffinterp.cr` — the Type 2 charstring interpreter: a port of
+  `psintrp.c` cf2_interpT2CharString (typed int/fixed operand stack,
+  width parsing, path/arithmetic operators, flex, seac via endchar, the
+  xorshift `random`) specialized to the unhinted no-stem-darkening
+  mode, plus the unhinted cf2_glyphpath from `pshints.c` and the
+  ps_builder outline callbacks from `psobjs.c`. 32-bit wrapping
+  arithmetic is carried over explicitly. A tracer is built in
+  (`CFF_TRACE=1`, the TT_TRACE counterpart).
+- `src/cff/face.cr` — the CFF-flavoured OTF face: a port of
+  `cff_slot_load` (cffgload.c) — advance from `hmtx`, FontMatrix →
+  translate → FT_MulFix scale in the cffgload.c order — reusing the
+  SFNT glue (cmap/hmtx) from `src/tt/sfnt.cr`. Returns the same
+  `TT::LoadedGlyph` as the TrueType loader.
 
 Note: FreeType hands fonts without bytecode (empty `fpgm`, `prep` ≤ 7
 bytes) to the auto-hinter (ftobjs.c:1016-1020) — so unhinted corpora
@@ -80,6 +99,23 @@ bmp = Ftrender.render_glyph(
 `load_glyph(gid, hint: false)` gives the FT_LOAD_NO_HINTING path;
 advances come back in 26.6 fixed point alongside the outline.
 
+CFF (OTF) fonts go through the same API:
+
+```crystal
+require "freetype-cr"
+
+face = CFF::Face.new(File.read("NimbusSans-Regular.otf").to_slice)
+face.set_pixel_size(16)
+
+gid = face.font.glyph_index('A'.ord)
+g = face.load_glyph(gid)                 # unhinted 26.6 outline + advance
+bmp = Ftrender.render_glyph(
+  Ftgrays::Outline.new(g.xs, g.ys, g.tags, g.contours))
+```
+
+`CFF::Face#load_glyph` returns the same `TT::LoadedGlyph` structure and
+renders through the same `Ftrender` as the TrueType path.
+
 ## Accuracy
 
 Verified with an oracle-diff against the system libfreetype (FFI in the
@@ -97,6 +133,32 @@ specs; the library itself never calls it):
   px) where the system libfreetype 2.13.3 disagrees with the FT master
   snapshot; this port matches the master (checked against a local
   build).
+- **CFF (OTF), unhinted:** **632 875 glyphs** across **140 OTF fonts**
+  (URW base35 + Extra, TeX Gyre, Latin Modern; 12/13/16/24/37 px) —
+  **0 diff** on outlines + advances against the system libfreetype with
+  FT_LOAD_NO_HINTING and `no-stem-darkening=TRUE` (the property is set
+  through FFI in the spec; the library itself assumes darkening is
+  off). A render smoke test (3 fonts × 16/24 px, full load → rasterize
+  → bitmap compare) is also 0-diff.
+
+### CFF limitations (honest)
+
+- **Hinting and stem darkening are not ported.** The Adobe engine
+  (`pshints.c`/`psblues.c`, ~4.5k lines of psaux) is not implemented:
+  glyphs always load unhinted, without darkening. Note that stock
+  libfreetype applies stem darkening even under FT_LOAD_NO_HINTING —
+  matching its default output would require that engine (a possible
+  stage B).
+- Bare CFF (`.cff` files with their own encoding/charset charmaps),
+  CFF2 and WOFF/WOFF2 wrappers are not parsed — only CFF1 inside an
+  SFNT/OTF.
+- The CID path (FDArray/FDSelect subfonts) is written following the C
+  but the corpus contains no CID-keyed font, so it is unverified
+  against the oracle.
+- The `random` operator seed is deterministic (FT's
+  InitialRandomSeed); FreeType derives the default seed from a memory
+  address, so glyphs using `random` may differ in the low bits of
+  perturbed coordinates.
 
 ## Performance: pure Crystal vs C through FFI
 
@@ -204,6 +266,10 @@ increase the review cost of acceptance.
   0xE7 mask — TOUCH bits are VM internals and vary between FT
   versions), bitmaps and advances against FT_LOAD_DEFAULT
   (198 790 glyphs, 0 diff).
+- `crystal run --release spec/cff_unhinted_diff.cr [-- fonts...]` — the
+  CFF acceptance diff: outlines (points + tags + contours) and advances
+  against FT_LOAD_NO_HINTING with `no-stem-darkening` set via FFI
+  (632 875 glyphs across 140 OTF fonts, 0 diff).
 - `crystal run --release spec/bench_render.cr -- [total] [batch]` —
   the performance benchmark (see above); `spec/bench_ffi.cr` — the
   FFI-call-cost microbenchmark; `spec/bench_diff.cr -- [n]` — a

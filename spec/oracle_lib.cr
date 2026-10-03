@@ -77,6 +77,8 @@ lib LibFT
   end
 
   fun init_free_type = FT_Init_FreeType(a_library : Void**) : Int32
+  fun property_set = FT_Property_Set(library : Void*, module_name : UInt8*,
+                                     property_name : UInt8*, value : Void*) : Int32
   fun new_memory_face = FT_New_Memory_Face(library : Void*, file_base : UInt8*,
                                            file_size : Long, face_index : Long,
                                            a_face : FaceRec**) : Int32

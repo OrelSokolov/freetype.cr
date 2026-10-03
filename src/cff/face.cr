@@ -1,0 +1,133 @@
+# CFF-flavoured OTF face: SFNT glue (cmap/hmtx from tt/sfnt.cr) around
+# the CFF table parser and the Type 2 interpreter — the port of
+# `cff_slot_load' (cffgload.c) specialised to FT_LOAD_NO_HINTING with
+# stem darkening disabled:
+#
+#   - the Adobe engine renders the glyph at the unhinted "unity" scale,
+#     leaving font-unit coordinates;
+#   - the advance comes from `hmtx' when the face has any (OTF always
+#     does), else from the charstring width;
+#   - a non-identity FontMatrix is applied (FT_Outline_Transform) before
+#     the final FT_MulFix scaling by x_scale — same operation order as
+#     cffgload.c (matrix, offset, scale).
+#
+# `hint: true' currently falls back to the unhinted path: the Adobe
+# hinting engine (stems/blues/counters + stem darkening) is not ported.
+
+require "../tt/sfnt"
+require "../tt/loader" # TT::LoadedGlyph
+require "./cffload"
+require "./cffinterp"
+
+module CFF
+  class Face
+    getter font : TT::Font
+    getter cff : Font
+
+    @px : Int32 = 0
+    @x_scale : Int64 = 0_i64
+
+    def initialize(data : Bytes)
+      # Same buffer-copy rationale as TT::HintedFace.
+      @font = TT::Font.new(data.dup)
+      raise ParseError.new("not a CFF-flavoured font (no 'CFF ' table)") \
+        if @font.cff_table.empty?
+      @cff = Font.new(@font.cff_table, @font.upem)
+    end
+
+    def num_glyphs : Int32
+      @font.num_glyphs
+    end
+
+    def glyph_index(codepoint : Int32) : Int32
+      @font.glyph_index(codepoint)
+    end
+
+    def set_pixel_size(px : Int32) : Nil
+      @px = px
+      @x_scale = Fixed.divfix(px.to_i64 << 6, @font.upem.to_i64)
+    end
+
+    # An unhinted glyph at the current pixel size, shaped like
+    # TT::LoadedGlyph: 26.6 outline at the glyph origin and the 26.6
+    # horizontal advance (what FT_Load_Glyph leaves in the slot).
+    def load_glyph(gid : Int32, hint : Bool = false) : TT::LoadedGlyph
+      builder = Builder.new
+      subfont = @cff.subfont_for(gid)
+      x_scale = @x_scale
+
+      # CID fonts may carry a subfont units-per-em different from the
+      # top dict's: cff_slot_load folds the ratio into the scale.
+      if @cff.subfonts.size > 0
+        top_upm = @cff.top_font.units_per_em
+        sub_upm = subfont.units_per_em
+        if top_upm != sub_upm
+          x_scale = Fixed.muldiv(x_scale, top_upm, sub_upm)
+        end
+      end
+
+      glyph_width = 0
+      begin
+        if entry = @cff.charstring(gid)
+          interp = Interpreter.new(@cff, builder, subfont)
+          glyph_width = interp.run(entry[0], entry[1], false, 0_i64, 0_i64)
+          # cf2_outline_close: one final close of the last contour (the
+          # earlier ones are closed by the next subpath's moveTo).
+          builder.close_contour
+        end
+      rescue ex : InterpError
+        # FreeType fails the load and leaves an empty glyph slot.
+        return TT::LoadedGlyph.new([] of Int64, [] of Int64, [] of UInt8,
+                                   [] of Int32, 0_i64)
+      end
+
+      # Now set the metrics (cffgload.c): the advance comes from hmtx.
+      advance : Int64
+      if @font.num_h_metrics > 0
+        advance = @font.h_metrics(gid)[0].to_i64
+      else
+        advance = glyph_width.to_i64
+      end
+
+      xs = builder.xs
+      ys = builder.ys
+
+      # Apply the font matrix, if any.
+      if subfont.matrix_xx != 0x1_0000 || subfont.matrix_yy != 0x1_0000 ||
+         subfont.matrix_xy != 0 || subfont.matrix_yx != 0
+        i = 0
+        while i < xs.size
+          x = xs[i]
+          y = ys[i]
+          xs[i] = Fixed.mulfix(x, subfont.matrix_xx) &+
+                  Fixed.mulfix(y, subfont.matrix_xy)
+          ys[i] = Fixed.mulfix(x, subfont.matrix_yx) &+
+                  Fixed.mulfix(y, subfont.matrix_yy)
+          i += 1
+        end
+        advance = Fixed.mulfix(advance, subfont.matrix_xx)
+      end
+
+      if subfont.offset_x != 0 || subfont.offset_y != 0
+        i = 0
+        while i < xs.size
+          xs[i] &+= subfont.offset_x
+          ys[i] &+= subfont.offset_y
+          i += 1
+        end
+        advance &+= subfont.offset_x
+      end
+
+      # Scale the outline and the advance.
+      i = 0
+      while i < xs.size
+        xs[i] = Fixed.mulfix(xs[i], x_scale)
+        ys[i] = Fixed.mulfix(ys[i], x_scale)
+        i += 1
+      end
+      advance = Fixed.mulfix(advance, x_scale)
+
+      TT::LoadedGlyph.new(xs, ys, builder.tags, builder.contours, advance)
+    end
+  end
+end
