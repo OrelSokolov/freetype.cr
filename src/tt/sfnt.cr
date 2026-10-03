@@ -12,10 +12,16 @@
 # Only what the pipeline needs is parsed; variations (fvar/gvar), embedded
 # bitmaps and hdmx are intentionally out of scope. WOFF1 wrappers are
 # unwrapped into a plain SFNT before parsing (see `TT.unwrap_woff');
-# WOFF2 (brotli) is out of scope.
+# WOFF2 too when built with -Dwith_woff2 (see tt/woff2.cr).
 
 require "compress/zlib"
 require "io/memory"
+
+# WOFF2 support is opt-in: it pulls in libbrotli through FFI, so it is
+# only compiled (and linked) when the `with_woff2' flag is given.
+{% if flag?(:with_woff2) %}
+require "./woff2"
+{% end %}
 
 module TT
   # Composite glyph flags (ttgload.c).
@@ -212,8 +218,21 @@ module TT
   # stored raw (compLength == origLength) or zlib-compressed; the
   # result is a reconstructed SFNT with the original flavor, a fresh
   # table directory and the tables re-padded to 4-byte alignment.
-  # Non-WOFF input is returned as-is. WOFF2 (brotli) is not supported.
+  # WOFF2 ('wOF2' magic) is unwrapped through libbrotli when built with
+  # -Dwith_woff2 (see tt/woff2.cr); without the flag it is an error.
+  # Any other input is returned as-is.
   def self.unwrap_woff(data : Bytes) : Bytes
+    if data.size >= 4 &&
+       data[0] == 0x77 && data[1] == 0x4F &&
+       data[2] == 0x46 && data[3] == 0x32 # 'wOF2'
+      {% if flag?(:with_woff2) %}
+        return TT.unwrap_woff2(data)
+      {% else %}
+        raise ParseError.new("WOFF2 fonts require a build with " \
+                             "-Dwith_woff2 (libbrotli)")
+      {% end %}
+    end
+
     return data unless data.size >= 44 &&
                        data[0] == 0x77 && data[1] == 0x4F &&
                        data[2] == 0x46 && data[3] == 0x46 # 'wOFF'

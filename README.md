@@ -49,7 +49,16 @@ render.
   Only what loading outlines and hinting need. WOFF1 wrappers are
   unwrapped into a plain SFNT before parsing (the `woff_open_font'
   approach, zlib via the Crystal stdlib) — `TT::Font`/`CFF::Face`
-  accept `.woff` buffers directly; WOFF2 (brotli) is out of scope.
+  accept `.woff` buffers directly; WOFF2 (brotli) is unwrapped the same
+  way when built with `-Dwith_woff2` (see `src/tt/woff2.cr`).
+- `src/tt/woff2.cr` — the WOFF2 counterpart (a port of FreeType's
+  `sfwoff2.c`): header/table-directory parsing, the 255UShort/base128
+  integer formats, brotli decompression of the table stream and the
+  reconstruction of transformed `glyf'/`loca' (triplet decoding,
+  bbox/nPoints/nContour substreams, composite glyphs) and `hmtx'.
+  Opt-in: the file (and the libbrotlidec link) is only compiled with
+  `-Dwith_woff2`; without the flag a `.woff2` buffer raises a ParseError
+  saying so. The default build gains no C dependency.
 - `src/tt/loader.cr` — a port of the hint glue from `ttgload.c`/
   `ttobjs.c`: scaling, `exec.run_fpgm`/`run_prep` (CVT in 26.6, as in
   C), `backward_compatibility`, simple and composite glyph loading,
@@ -169,6 +178,13 @@ specs; the library itself never calls it):
   three OTFs and the CID Noto above, all re-wrapped as WOFF1 with
   zlib-compressed tables) — **0 diff** against the system libfreetype
   loading the same `.woff` files.
+- **WOFF2 (opt-in, `-Dwith_woff2`):** 4 625 glyphs across 3 real webfonts
+  (Roboto and Open Sans — hinted, i.e. the reconstructed `glyf' feeds the
+  full bytecode pipeline, outline+bitmap+advance diffed; Lora —
+  unhinted) — **0 diff** against the system libfreetype loading the same
+  `.woff2` files. Covers transformed `glyf'/`loca' (simple, composite,
+  empty glyphs, explicit and computed bboxes), transformed `hmtx' and
+  short `loca' (indexToLocFormat 0).
 
 ### CFF limitations (honest)
 
@@ -180,9 +196,14 @@ specs; the library itself never calls it):
   matches stock libfreetype (verified glyph-for-glyph). Enabling
   darkening via `FT_Property_Set` would diverge. Subfonts with a
   non-identity FontMatrix still load through the unhinted path.
-- Bare CFF (`.cff` files with their own encoding/charset charmaps),
-  CFF2 and WOFF2 wrappers are not parsed — only CFF1 in an SFNT/OTF
-  and WOFF1 (which is unwrapped to SFNT transparently).
+- Bare CFF (`.cff` files with their own encoding/charset charmaps) and
+  CFF2 are not parsed — only CFF1 in an SFNT/OTF and WOFF1 (which is
+  unwrapped to SFNT transparently). WOFF2 is unwrapped too, but only in
+  builds with `-Dwith_woff2` (it links libbrotlidec through FFI; the
+  reconstruction itself, including the transformed `glyf'/`hmtx', is
+  pure Crystal). WOFF2 collections are parsed (the first face is
+  extracted) but face selection is not exposed yet; CFF2 charstring
+  transforms are rejected.
 - CID (FDArray/FDSelect) is implemented and oracle-verified on
   Noto Sans CJK JP; other CID fonts passed through the same code path,
   but that is the only CID font in the acceptance corpus.
@@ -304,6 +325,12 @@ increase the review cost of acceptance.
 - `crystal run --release spec/cff_hinted_diff.cr [-- fonts...]` — the
   hinted CFF acceptance diff against FT_LOAD_DEFAULT (Adobe engine,
   darkening off): 632 875 glyphs across 140 OTF fonts, 0 diff.
+- `crystal run --release -Dwith_woff2 spec/woff2_diff.cr` — the WOFF2
+  acceptance diff (see above). Skips itself with a note when the flag
+  is absent, no corpus (`tmp_check/w2_*.woff2`) is found, or the
+  passed files are missing — so it is safe to invoke unconditionally;
+  it is intentionally not part of CI (the CI oracle FreeType is built
+  without brotli and the flag would drag libbrotlidec into the link).
 - `crystal run --release spec/bench_render.cr -- [total] [batch]` —
   the performance benchmark (see above); `spec/bench_ffi.cr` — the
   FFI-call-cost microbenchmark; `spec/bench_diff.cr -- [n]` — a
