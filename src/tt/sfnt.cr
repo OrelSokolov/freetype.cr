@@ -220,74 +220,103 @@ module TT
   # table directory and the tables re-padded to 4-byte alignment.
   # WOFF2 ('wOF2' magic) is unwrapped through libbrotli when built with
   # -Dwith_woff2 (see tt/woff2.cr); without the flag it is an error.
-  # Any other input is returned as-is.
-  def self.unwrap_woff(data : Bytes) : Bytes
+  # Bare collections ('ttcf') are returned as-is — they are handled
+  # through `ttcf_face_offset'/`Font#@base' instead (slicing would
+  # corrupt their file-relative table offsets). Any other input is
+  # returned as-is.
+  def self.unwrap_woff(data : Bytes, face_index : Int32 = 0) : Bytes
     if data.size >= 4 &&
        data[0] == 0x77 && data[1] == 0x4F &&
        data[2] == 0x46 && data[3] == 0x32 # 'wOF2'
       {% if flag?(:with_woff2) %}
-        return TT.unwrap_woff2(data)
+        return TT.unwrap_woff2(data, face_index)
       {% else %}
         raise ParseError.new("WOFF2 fonts require a build with " \
                              "-Dwith_woff2 (libbrotli)")
       {% end %}
     end
 
-    return data unless data.size >= 44 &&
-                       data[0] == 0x77 && data[1] == 0x4F &&
-                       data[2] == 0x46 && data[3] == 0x46 # 'wOFF'
+    if data.size >= 44 &&
+       data[0] == 0x77 && data[1] == 0x4F &&
+       data[2] == 0x46 && data[3] == 0x46 # 'wOFF'
+      length = ru32(data, 8)
+      raise ParseError.new("WOFF length field out of bounds") if length != data.size
+      num_tables = ru16(data, 12)
+      raise ParseError.new("WOFF reserved field must be 0") unless ru16(data, 14) == 0
+      raise ParseError.new("WOFF table directory out of bounds") if 44 + 20*num_tables > data.size
 
-    length = ru32(data, 8)
-    raise ParseError.new("WOFF length field out of bounds") if length != data.size
-    num_tables = ru16(data, 12)
-    raise ParseError.new("WOFF reserved field must be 0") unless ru16(data, 14) == 0
-    raise ParseError.new("WOFF table directory out of bounds") if 44 + 20*num_tables > data.size
-
-    entries = Array({Bytes, Int32, Int32, Int32, UInt32}).new(num_tables)
-    sfnt_size = 12 + 16*num_tables
-    num_tables.times do |i|
-      off = 44 + 20*i
-      tag = data[off, 4]
-      table_off = ru32(data, off + 4)
-      comp_len = ru32(data, off + 8)
-      orig_len = ru32(data, off + 12)
-      checksum = ru32(data, off + 16)
-      raise ParseError.new("WOFF table out of bounds") if comp_len > orig_len ||
-        table_off + comp_len > data.size
-      entries << {tag, table_off.to_i32, comp_len.to_i32, orig_len.to_i32, checksum}
-      sfnt_size += (orig_len + 3) &~ 3
-    end
-
-    sfnt = Bytes.new(sfnt_size, 0)
-    flavor = ru32(data, 4)
-    w32(sfnt, 0, flavor)
-    w16(sfnt, 4, num_tables)
-    entry_selector = num_tables.bit_length - 1 # floor(log2)
-    search_range = 16 << entry_selector
-    w16(sfnt, 6, search_range)
-    w16(sfnt, 8, entry_selector)
-    w16(sfnt, 10, 16*num_tables - search_range)
-
-    dir_off = 12
-    data_off = 12 + 16*num_tables
-    entries.each do |tag, table_off, comp_len, orig_len, checksum|
-      tag.copy_to(sfnt[dir_off, 4])
-      w32(sfnt, dir_off + 4, checksum)
-      w32(sfnt, dir_off + 8, data_off)
-      w32(sfnt, dir_off + 12, orig_len)
-
-      src = data[table_off, comp_len]
-      if comp_len == orig_len
-        src.copy_to(sfnt[data_off, orig_len])
-      else
-        io = IO::Memory.new(src)
-        reader = Compress::Zlib::Reader.new(io)
-        reader.read_fully(sfnt[data_off, orig_len])
+      entries = Array({Bytes, Int32, Int32, Int32, UInt32}).new(num_tables)
+      sfnt_size = 12 + 16*num_tables
+      num_tables.times do |i|
+        off = 44 + 20*i
+        tag = data[off, 4]
+        table_off = ru32(data, off + 4)
+        comp_len = ru32(data, off + 8)
+        orig_len = ru32(data, off + 12)
+        checksum = ru32(data, off + 16)
+        raise ParseError.new("WOFF table out of bounds") if comp_len > orig_len ||
+          table_off + comp_len > data.size
+        entries << {tag, table_off.to_i32, comp_len.to_i32, orig_len.to_i32, checksum}
+        sfnt_size += (orig_len + 3) &~ 3
       end
-      data_off += (orig_len + 3) &~ 3
-      dir_off += 16
+
+      sfnt = Bytes.new(sfnt_size, 0)
+      flavor = ru32(data, 4)
+      w32(sfnt, 0, flavor)
+      w16(sfnt, 4, num_tables)
+      entry_selector = num_tables.bit_length - 1 # floor(log2)
+      search_range = 16 << entry_selector
+      w16(sfnt, 6, search_range)
+      w16(sfnt, 8, entry_selector)
+      w16(sfnt, 10, 16*num_tables - search_range)
+
+      dir_off = 12
+      data_off = 12 + 16*num_tables
+      entries.each do |tag, table_off, comp_len, orig_len, checksum|
+        tag.copy_to(sfnt[dir_off, 4])
+        w32(sfnt, dir_off + 4, checksum)
+        w32(sfnt, dir_off + 8, data_off)
+        w32(sfnt, dir_off + 12, orig_len)
+
+        src = data[table_off, comp_len]
+        if comp_len == orig_len
+          src.copy_to(sfnt[data_off, orig_len])
+        else
+          io = IO::Memory.new(src)
+          reader = Compress::Zlib::Reader.new(io)
+          reader.read_fully(sfnt[data_off, orig_len])
+        end
+        data_off += (orig_len + 3) &~ 3
+        dir_off += 16
+      end
+      return sfnt
     end
-    sfnt
+
+    # TrueType/OpenType collections are NOT handled here: their table
+    # offsets are file-relative, so the face cannot be sliced out —
+    # see `ttcf_face_offset' and the @base handling in `Font'.
+    data
+  end
+
+  # A bare TrueType/OpenType collection ('ttcf' magic): return the
+  # byte offset of face `face_index''s SFNT inside the buffer, or nil
+  # for anything that is not a collection. Table offsets inside a
+  # member face are relative to the START OF THE FILE (shared table
+  # data), so callers must keep the whole buffer and add this base —
+  # slicing would corrupt every table offset.
+  def self.ttcf_face_offset(data : Bytes, face_index : Int32 = 0) : Int32?
+    return nil unless data.size >= 12 &&
+                      data[0] == 0x74 && data[1] == 0x74 &&
+                      data[2] == 0x63 && data[3] == 0x66 # 'ttcf'
+    num_fonts = ru32(data, 8).to_i32
+    raise ParseError.new("invalid TTC header") if num_fonts <= 0 ||
+      12 + 4*num_fonts > data.size
+    raise ParseError.new("TTC face index out of range") if
+      face_index < 0 || face_index >= num_fonts
+    offset = ru32(data, 12 + 4*face_index).to_i32
+    raise ParseError.new("invalid TTC face offset") if
+      offset == 0 || offset < 0 || offset + 12 > data.size
+    offset
   end
 
   private def self.ru16(d : Bytes, off : Int32) : UInt16
@@ -350,19 +379,27 @@ module TT
     @cmap12 : Cmap12?
     @kern_tables : Array(Kern0) = [] of Kern0
 
-    def initialize(data : Bytes)
-      data = TT.unwrap_woff(data)
+    # Byte offset of this face's SFNT inside `@data' — non-zero for a
+    # member of a TTC/OTC collection (its table offsets are
+    # file-relative; see `TT.ttcf_face_offset').
+    @base : Int32 = 0
+
+    def initialize(data : Bytes, face_index : Int32 = 0)
+      @base = (TT.ttcf_face_offset(data, face_index) || 0)
+      data = TT.unwrap_woff(data, face_index)
       @data = data
       d = @data
-      raise ParseError.new("not an SFNT font (too small)") if d.size < 12
+      raise ParseError.new("not an SFNT font (too small)") if d.size < @base + 12
 
-      num_tables = u16(d, 4)
+      num_tables = u16(d, @base + 4)
       tables = Hash(String, Tuple(Int32, Int32)).new
       i = 0
       while i < num_tables
-        off = 12 + 16*i
+        off = @base + 12 + 16*i
         raise ParseError.new("table directory out of bounds") if off + 16 > d.size
         tag = String.new(d[off, 4])
+        # table offsets are always file-relative (in a collection they
+        # point into the shared data beyond @base) — no @base here
         tables[tag] = {i32(d, off + 8), i32(d, off + 12)} # offset, length
         i += 1
       end

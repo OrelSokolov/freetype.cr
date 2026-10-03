@@ -30,9 +30,9 @@ module CFF
     @px : Int32 = 0
     @x_scale : Int64 = 0_i64
 
-    def initialize(data : Bytes)
+    def initialize(data : Bytes, face_index : Int32 = 0)
       # Same buffer-copy rationale as TT::HintedFace.
-      @font = TT::Font.new(data.dup)
+      @font = TT::Font.new(data.dup, face_index)
       raise ParseError.new("not a CFF-flavoured font (no 'CFF ' table)") \
         if @font.cff_table.empty?
       @cff = Font.new(@font.cff_table, @font.upem)

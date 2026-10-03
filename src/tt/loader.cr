@@ -139,13 +139,13 @@ module TT
     @scr_storage = Array(Int64).new(0, 0_i64)
     @scr_pp = Array({Int64, Int64}).new(4, {0_i64, 0_i64})
 
-    def initialize(data : Bytes)
+    def initialize(data : Bytes, face_index : Int32 = 0)
       # Copy the buffer: callers routinely pass a slice into a temporary
       # String (File.read(...).to_slice), which the GC may collect while
       # the face is alive — the parsed tables would silently go garbage
       # mid-run. Fonts are a few hundred KB; the copy is the cheap half
       # of this safety.
-      @font = Font.new(data.dup)
+      @font = Font.new(data.dup, face_index)
       # Reserve extra stack slots for broken fonts (tt_size_init_bytecode in
       # ttobjs.c): 50% more than maxStackElements, minimum +128 — e.g. the
       # variable Ubuntu Sans Mono declares maxStackElements=0 yet ships a

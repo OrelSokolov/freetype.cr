@@ -51,6 +51,9 @@ render.
   approach, zlib via the Crystal stdlib) — `TT::Font`/`CFF::Face`
   accept `.woff` buffers directly; WOFF2 (brotli) is unwrapped the same
   way when built with `-Dwith_woff2` (see `src/tt/woff2.cr`).
+  TrueType/OpenType collections (`.ttc`/`.otc`) are handled by slicing
+  out the requested face: pass `face_index` to `TT::Font`/
+  `TT::HintedFace`/`CFF::Face` (it reaches WOFF2 collections too).
 - `src/tt/woff2.cr` — the WOFF2 counterpart (a port of FreeType's
   `sfwoff2.c`): header/table-directory parsing, the 255UShort/base128
   integer formats, brotli decompression of the table stream and the
@@ -185,6 +188,13 @@ specs; the library itself never calls it):
   `.woff2` files. Covers transformed `glyf'/`loca' (simple, composite,
   empty glyphs, explicit and computed bboxes), transformed `hmtx' and
   short `loca' (indexToLocFormat 0).
+- **TTC/OTC collections:** all **30 faces** of the system Noto CJK
+  collections (NotoSansCJK/NotoSerifCJK Regular+Bold, CFF-flavoured;
+  10+10 Sans + 5+5 Serif faces) loaded through
+  `CFF::Face.new(data, face_index)' — outlines + advances, hinted
+  (Adobe engine) and unhinted, **7 864 200 glyph comparisons, 0 diff**
+  against the system libfreetype opening the same `.ttc' with the same
+  face index.
 
 ### CFF limitations (honest)
 
@@ -201,9 +211,7 @@ specs; the library itself never calls it):
   unwrapped to SFNT transparently). WOFF2 is unwrapped too, but only in
   builds with `-Dwith_woff2` (it links libbrotlidec through FFI; the
   reconstruction itself, including the transformed `glyf'/`hmtx', is
-  pure Crystal). WOFF2 collections are parsed (the first face is
-  extracted) but face selection is not exposed yet; CFF2 charstring
-  transforms are rejected.
+  pure Crystal). CFF2 charstring transforms are rejected.
 - CID (FDArray/FDSelect) is implemented and oracle-verified on
   Noto Sans CJK JP; other CID fonts passed through the same code path,
   but that is the only CID font in the acceptance corpus.
@@ -331,6 +339,10 @@ increase the review cost of acceptance.
   passed files are missing — so it is safe to invoke unconditionally;
   it is intentionally not part of CI (the CI oracle FreeType is built
   without brotli and the flag would drag libbrotlidec into the link).
+- `crystal run --release spec/ttc_diff.cr [-- fonts.ttc ...]` — the
+  collection acceptance diff: every face of a `.ttc'/`.otc' (default
+  corpus: the system Noto CJK collections) diffed against the system
+  libfreetype opened with the same face index, hinted and unhinted.
 - `crystal run --release spec/bench_render.cr -- [total] [batch]` —
   the performance benchmark (see above); `spec/bench_ffi.cr` — the
   FFI-call-cost microbenchmark; `spec/bench_diff.cr -- [n]` — a

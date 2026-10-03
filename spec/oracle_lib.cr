@@ -135,13 +135,14 @@ end
 class FtFace
   getter face : LibFT::FaceRec*
 
-  def initialize(library : Void*, path : String)
+  def initialize(library : Void*, path : String, face_index : Int32 = 0)
     data = File.read(path)
     @buf = LibC.malloc(data.bytesize)
     data.to_unsafe.copy_to(@buf.as(UInt8*), data.bytesize)
     @face = Pointer(LibFT::FaceRec).null
-    err = LibFT.new_memory_face(library, @buf.as(UInt8*), data.bytesize, 0, pointerof(@face))
-    raise "FT_New_Memory_Face(#{path}) failed: #{err}" if err != 0
+    err = LibFT.new_memory_face(library, @buf.as(UInt8*), data.bytesize,
+                                face_index.to_i64, pointerof(@face))
+    raise "FT_New_Memory_Face(#{path}##{face_index}) failed: #{err}" if err != 0
   end
 
   def done : Nil
