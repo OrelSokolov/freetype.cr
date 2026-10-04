@@ -86,6 +86,9 @@ jobs:
       - name: Hinted pipeline diff vs libfreetype
         run: crystal run --release --error-trace spec/tt_hinted_diff.cr
 
+      - name: Auto-hinter diff vs libfreetype (unhinted Roboto corpus)
+        run: crystal run --release --error-trace spec/autohint_diff.cr
+
       - name: MONO/LCD/LCD_V render diff vs libfreetype
         run: crystal run --release --error-trace spec/mono_lcd_diff.cr
 

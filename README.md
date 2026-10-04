@@ -57,6 +57,22 @@ render.
 - `src/fttrigon.cr` — a port of `fttrigon.c` (fixed-point trigonometry:
   `FT_Vector_Rotate`, `FT_Vector_Norm_Len`, etc. — needed for
   projections onto arbitrary axes in the bytecode).
+- `src/autofit/` — the auto-hinter (`src/autofit/*` of FreeType): the
+  shared point/segment/edge machinery (`afhints.cr`), the latin writing
+  system (`aflatin.cr` — global metrics with blue zones, stem widths,
+  digit check, segment linking with the demerit scoring, edge hinting;
+  the dummy `none_dflt` fallback is folded into `LatinMetrics`), the
+  CJK writing system (`afcjk.cr` — per-dimension blue zones, the
+  distance-based segment linking with serif de-linking, the
+  `af_hint_normal_stem` grid fitter, `AF_SCALER_FLAG_NO_ADVANCE`), the
+  style coverage scan with the lazily built per-style metrics
+  (`afglobal.cr` — the hani fallback of CJK-enabled builds; a latin
+  style without blue zones is disabled to `none_dflt', as in
+  `af_latin_metrics_init_blues`), and the `af_loader_load_glyph` glue
+  (`afloader.cr`) on top of both the TT and the CFF face (the CFF hook
+  mirrors FT_LOAD_FORCE_AUTOHINT). Segment/edge indices replace the C
+  pointer arithmetic; `afblue_data.cr`/`afranges_data.cr` are generated
+  from the FreeType sources.
 - `src/tt/sfnt.cr` — a minimal SFNT parser: head, maxp, hhea, hmtx,
   cmap (formats 4 and 12), loca, glyf, cvt, fpgm, prep, gasp, kern.
   Only what loading outlines and hinting need. WOFF1 wrappers are

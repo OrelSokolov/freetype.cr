@@ -353,6 +353,8 @@ module TT
     getter os2_fs_selection : UInt16 = 0_u16 # USE_TYPO_METRICS = bit 7 (0x80)
     getter us_win_ascent : Int32 = 0
     getter us_win_descent : Int32 = 0
+    getter mac_style : UInt16 = 0_u16 # head.macStyle: bit 1 = italic
+    getter is_fixed_pitch : Bool = false # post.isFixedPitch
     getter hhea_ascender : Int32
     getter hhea_descender : Int32
     getter max_points : Int32
@@ -410,6 +412,12 @@ module TT
       raise ParseError.new("invalid unitsPerEm") if upem == 0
       @upem = upem.to_i32
       @index_to_loc_format = i16(d, head[0] + 50).to_i32
+      @mac_style = u16(d, head[0] + 44)
+
+      # post.isFixedPitch (offset 12 in the table header)
+      if (post = tables["post"]?) && post[1] >= 16 && post[0] + 16 <= d.size
+        @is_fixed_pitch = u32(d, post[0] + 12) != 0
+      end
 
       maxp = table(tables, "maxp")
       check_len(maxp, 6, "maxp")

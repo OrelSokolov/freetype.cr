@@ -51,6 +51,78 @@ module CFF
       @x_scale = Fixed.divfix(px.to_i64 << 6, @font.upem.to_i64)
     end
 
+    def pixel_size : Int32
+      @px
+    end
+
+    def x_scale : Int64
+      @x_scale
+    end
+
+    # CFF faces scale both axes alike (no anisotropic size support).
+    def y_scale : Int64
+      @x_scale
+    end
+
+    # The FT_LOAD_NO_SCALE variant of the unhinted load — what the
+    # auto-hinter feeds on: the font-unit outline (FontMatrix/offset
+    # applied exactly as in the scaled unhinted path, minus the final
+    # scaling) and the unscaled advance.
+    def load_glyph_font_units(gid : Int32) : TT::LoadedGlyph
+      builder = Builder.new
+      subfont = @cff.subfont_for(gid)
+      glyph_width = 0
+
+      begin
+        if entry = @cff.charstring(gid)
+          interp = Interpreter.new(@cff, builder, subfont)
+          glyph_width = interp.run(entry[0], entry[1], false, 0_i64, 0_i64)
+          builder.close_contour
+        end
+      rescue ex : InterpError
+        return TT::LoadedGlyph.new([] of Int64, [] of Int64, [] of UInt8,
+                                   [] of Int32, 0_i64)
+      end
+
+      advance : Int64
+      if @font.num_h_metrics > 0
+        advance = @font.h_metrics(gid)[0].to_i64
+      else
+        advance = glyph_width.to_i64
+      end
+
+      xs = builder.xs
+      ys = builder.ys
+
+      # Apply the font matrix, if any.
+      if subfont.matrix_xx != 0x1_0000 || subfont.matrix_yy != 0x1_0000 ||
+         subfont.matrix_xy != 0 || subfont.matrix_yx != 0
+        i = 0
+        while i < xs.size
+          x = xs[i]
+          y = ys[i]
+          xs[i] = Fixed.mulfix(x, subfont.matrix_xx) &+
+                  Fixed.mulfix(y, subfont.matrix_xy)
+          ys[i] = Fixed.mulfix(x, subfont.matrix_yx) &+
+                  Fixed.mulfix(y, subfont.matrix_yy)
+          i += 1
+        end
+        advance = Fixed.mulfix(advance, subfont.matrix_xx)
+      end
+
+      if subfont.offset_x != 0 || subfont.offset_y != 0
+        i = 0
+        while i < xs.size
+          xs[i] &+= subfont.offset_x
+          ys[i] &+= subfont.offset_y
+          i += 1
+        end
+        advance &+= subfont.offset_x
+      end
+
+      TT::LoadedGlyph.new(xs, ys, builder.tags, builder.contours, advance)
+    end
+
     # An unhinted glyph at the current pixel size, shaped like
     # TT::LoadedGlyph: 26.6 outline at the glyph origin and the 26.6
     # horizontal advance (what FT_Load_Glyph leaves in the slot).

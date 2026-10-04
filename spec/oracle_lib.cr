@@ -18,6 +18,7 @@ lib LibFT
                            # FT_LOAD_VERTICAL_LAYOUT
   FT_LOAD_RENDER     = 0x4
   FT_LOAD_NO_BITMAP  = 0x8
+  FT_LOAD_FORCE_AUTOHINT = 0x20 # (1L << 5)
   FT_PIXEL_MODE_GRAY = 2
 
   # FT_Render_Mode_ (ftimage.h)

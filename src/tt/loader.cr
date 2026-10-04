@@ -109,6 +109,7 @@ module TT
     @y_scale : Int64 = 0_i64
     @tt_scale : Int64 = 0_i64 # ttmetrics.scale (square ppem -> x_scale)
     @size_gs : SizeGs = SizeGs.new
+    @use_autohint = false
     @cvt_base : Array(Int64) = [] of Int64   # post-prep CVT (persistent)
     @storage_base : Array(Int64) = [] of Int64
     @fpgm_done = false
@@ -146,6 +147,9 @@ module TT
       # mid-run. Fonts are a few hundred KB; the copy is the cheap half
       # of this safety.
       @font = Font.new(data.dup, face_index)
+      # FT hands fonts without bytecode to the auto-hinter (ftobjs.c:
+      # empty `fpgm' and `prep' of at most 7 bytes).
+      @use_autohint = @font.fpgm.empty? && @font.prep.size <= 7
       # Reserve extra stack slots for broken fonts (tt_size_init_bytecode in
       # ttobjs.c): 50% more than maxStackElements, minimum +128 — e.g. the
       # variable Ubuntu Sans Mono declares maxStackElements=0 yet ships a
@@ -162,6 +166,42 @@ module TT
 
     def num_glyphs : Int32
       font.num_glyphs
+    end
+
+    # Active size parameters for the auto-hint glue (af_loader scaler).
+    def pixel_size : Int32
+      @px
+    end
+
+    def x_scale : Int64
+      @x_scale
+    end
+
+    def y_scale : Int64
+      @y_scale
+    end
+
+    # FT_LOAD_NO_SCALE | FT_LOAD_LINEAR_DESIGN: the unhinted outline in
+    # font units at origin (0,0) and the advance in font units — the
+    # input the auto-hinter expects.
+    def load_glyph_font_units(gid : Int32) : LoadedGlyph
+      acc = Acc.new
+      @chain.clear
+      saved_x = @x_scale
+      saved_y = @y_scale
+      @x_scale = 0x10000_i64
+      @y_scale = 0x10000_i64
+      begin
+        pp = load_glyph_rec(gid, 0, false, acc, @chain)
+      ensure
+        @x_scale = saved_x
+        @y_scale = saved_y
+      end
+      advance = pp[1][0] &- pp[0][0]
+      # TT_Load_Glyph translates the outline by -pp1.x = lsb - xMin even at
+      # FT_LOAD_NO_SCALE (ttgload.c: `if (loader.pp1.x) FT_Outline_Translate').
+      acc.xs.map! { |x| x &- pp[0][0] } if pp[0][0] != 0
+      LoadedGlyph.new(acc.xs, acc.ys, acc.tags, acc.contour_ends, advance)
     end
 
     # Profiling helper (see TT::OPCOUNT_ENABLED).
@@ -231,10 +271,24 @@ module TT
       @prep_px = px
     end
 
+    # Auto-hinter hook: overridden by the autofit glue (autofit/afloader.cr)
+    # when it is linked in — returns the auto-hinted glyph, or nil when the
+    # autofit port is not available (then the plain bytecode path runs).
+    def load_glyph_autohint(gid : Int32) : LoadedGlyph?
+      nil
+    end
+
     def load_glyph(gid : Int32, hint : Bool = true) : LoadedGlyph
       raise "call set_pixel_size first" if @prep_px <= 0
       hinted_load = hint # FT flag state (grid-fit applies to it)
       hint = false unless @hinting_enabled
+
+      # FT_Load_Glyph hands fonts without bytecode (empty `fpgm' and a
+      # `prep' of at most 7 bytes, ftobjs.c) to the auto-hinter.
+      if hinted_load && @use_autohint
+        ah = load_glyph_autohint(gid)
+        return ah if ah
+      end
 
       acc = Acc.new # fresh per glyph: its arrays ship out in LoadedGlyph
       @chain.clear
