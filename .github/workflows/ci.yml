@@ -35,7 +35,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             fonts-dejavu-core fonts-dejavu-extra fonts-liberation \
             fonts-roboto-unhinted fonts-noto-core \
-            fonts-urw-base35 fonts-texgyre fonts-lmodern
+            fonts-urw-base35 fonts-texgyre fonts-lmodern fonts-ubuntu
 
       # CID-keyed CFF font for the FDArray/FDSelect acceptance run
       # (~16 MB; the URL is the noto-cjk repo's raw OTF).
@@ -88,6 +88,15 @@ jobs:
 
       - name: Auto-hinter diff vs libfreetype (unhinted Roboto corpus)
         run: crystal run --release --error-trace spec/autohint_diff.cr
+
+      - name: GX variations diff vs libfreetype (variable Ubuntu corpus)
+        run: crystal run --release --error-trace spec/var_diff.cr
+
+      - name: cvar diff vs libfreetype (synthesized variable Liberation)
+        run: crystal run --release --error-trace spec/var_cvar_diff.cr
+
+      - name: CFF2 variations diff vs libfreetype (SourceSerif4Variable)
+        run: crystal run --release --error-trace spec/cff2_var_diff.cr
 
       - name: MONO/LCD/LCD_V render diff vs libfreetype
         run: crystal run --release --error-trace spec/mono_lcd_diff.cr

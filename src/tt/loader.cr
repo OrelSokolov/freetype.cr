@@ -16,6 +16,7 @@
 require "../fttrigon"
 require "./sfnt"
 require "./ttinterp"
+require "./ttgxvar"
 
 module TT
   # Fixed-point replicas of the LP64 FreeType helpers.
@@ -116,6 +117,12 @@ module TT
     @prep_px = -1
     @backward_compat = false
     @hinting_enabled = true # cleared when prep sets instruct_control bit 0
+    # GX variations (ttgxvar.cr): nil for a static font. `doblend' mirrors
+    # face->doblend — set by #set_var_design, gates every delta path.
+    @blend : TT::GXBlend? = nil
+    @doblend = false
+    @design_coords : Array(Int64) = [] of Int64 # blend->coords (raw input)
+    @normalized : Array(Int64) = [] of Int64    # blend->normalizedcoords
     # First VM failure ('fpgm'/'prep'/glyph program), for diagnostics:
     # once set, this face renders unhinted (see set_pixel_size/load_glyph).
     getter vm_error : String?
@@ -147,9 +154,12 @@ module TT
       # mid-run. Fonts are a few hundred KB; the copy is the cheap half
       # of this safety.
       @font = Font.new(data.dup, face_index)
-      # FT hands fonts without bytecode to the auto-hinter (ftobjs.c:
-      # empty `fpgm' and `prep' of at most 7 bytes).
-      @use_autohint = @font.fpgm.empty? && @font.prep.size <= 7
+      # FT hands bytecode-less fonts to the auto-hinter (ftobjs.c: an SFNT
+      # with a non-empty `loca', maxp.maxSizeOfInstructions == 0, and both
+      # `fpgm' and `prep' EMPTY — not merely tiny: a 7-byte `prep' font
+      # still goes through the bytecode path with no glyph programs).
+      @use_autohint = @font.fpgm.empty? && @font.prep.empty? &&
+                      @font.max_size_of_instructions == 0
       # Reserve extra stack slots for broken fonts (tt_size_init_bytecode in
       # ttobjs.c): 50% more than maxStackElements, minimum +128 — e.g. the
       # variable Ubuntu Sans Mono declares maxStackElements=0 yet ships a
@@ -162,6 +172,40 @@ module TT
         padded_stack,
         font.max_twilight,
       )
+    end
+
+    # FT_Set_Var_Design_Coordinates (TT_Set_Var_Design): store the design
+    # coordinates, normalize them, and turn on blending. Coordinates beyond
+    # the axis count are dropped; missing ones default to the axes'
+    # defaults. A no-op for static fonts. Changing the coordinates on a
+    # size that already ran `prep' invalidates it — FreeType reloads the
+    # `cvar'-adjusted CVT and resets size->cvt_ready so the `prep'
+    # program reruns with the new values.
+    def set_var_design(coords : Array(Int64)) : Nil
+      blend = (@blend ||= TT::GXBlend.from_font(font) rescue nil)
+      return if blend.nil?
+      n = {coords.size, blend.num_axis}.min
+      cs = Array(Int64).new(blend.num_axis, 0_i64)
+      blend.num_axis.times do |i|
+        cs[i] = i < n ? coords.unsafe_fetch(i) : blend.axis[i].default
+      end
+      @design_coords = cs
+      @normalized = blend.to_normalized(cs)
+      @doblend = true
+      # TT_Set_Var_Design leaves the normalized coordinates in
+      # face->blend, where the interpreter's GETVARIATION/GETDATA and
+      # GETINFO's VARIATION GLYPH bit read them.
+      @exec.variation_coords = @normalized.dup
+
+      if @prep_px > 0
+        @prep_px = -1 # force `fpgm'/`prep' rerun with the new CVT
+        set_pixel_size(@px)
+      end
+    end
+
+    # The current design coordinates (empty for a static/unset face).
+    def var_design_coords : Array(Int64)
+      @design_coords.dup
     end
 
     def num_glyphs : Int32
@@ -222,8 +266,15 @@ module TT
       exec.scale_x = @x_scale
       exec.scale_y = @y_scale
       exec.tt_scale = @tt_scale
-      # VM contract mirrors C's face->cvt: raw font units shifted to 26.6.
-      exec.cvt_raw = font.cvt.map { |v| v.to_i64 &* 64 }
+      # VM contract mirrors C's face->cvt: raw font units shifted to 26.6;
+      # with blending, the `cvar' deltas (in F26Dot6) are folded in, as
+      # tt_face_load_cvt/tt_face_vary_cvt leave them in face->cvt.
+      cvt_raw = font.cvt.map { |v| v.to_i64 &* 64 }
+      if (blend = @blend) && @doblend
+        deltas = blend.vary_cvt(cvt_raw.size, @normalized)
+        cvt_raw.size.times { |i| cvt_raw[i] &+= deltas.unsafe_fetch(i) }
+      end
+      exec.cvt_raw = cvt_raw
 
       # --- `fpgm': once per face (tt_size_ready_bytecode).  C has size->cvt
       # scaled at this point; prep rescales from the raw table anyway.
@@ -344,6 +395,13 @@ module TT
       aw, lsb = font.h_metrics(gid)
       tsb, ah = font.v_metrics(gid, y_max)
 
+      # tt_face_get_metrics + tt_hadvance_adjust: HVAR owns the advance
+      # (for composites the USE_MY_METRICS component's delta applies —
+      # it is added in that component's own recursive call).
+      if (blend = @blend) && @doblend && blend.has_hvar?
+        aw &+= blend.advance_delta(gid, @normalized)
+      end
+
       # tt_loader_set_pp (font units) -- into the shared scratch (the
       # array travels down the composite recursion unchanged).
       pp1x = x_min.to_i64 &- lsb
@@ -358,7 +416,8 @@ module TT
       pp[3] = {half, pp[3][1]}
 
       if byte_len == 0 || n_contours == 0
-        # empty glyph: scale phantom points (ttgload.c shortcut path)
+        # empty glyph: vary the phantom points (ttgload.c), then scale
+        vary_phantoms(gid, pp)
         scale_pp(pp)
         chain.delete(gid)
         return pp
@@ -366,13 +425,16 @@ module TT
 
       if n_contours > 0
         # simple glyph: phantoms are scaled together with the points in
-        # TT_Process_Simple_Glyph -- pp stays in font units here
+        # TT_Process_Simple_Glyph -- pp stays in font units here (the
+        # deltas are applied inside process_simple)
         process_simple(gid, pp, hint, acc)
       else
-        # composite: scale phantom points (ttgload.c lines ~1795-1807)
+        # composite: vary the phantom points before scaling (ttgload.c
+        # lines ~1583-1608), then scale and assemble
+        vary_phantoms(gid, pp)
         scale_pp(pp)
         g = font.composite_glyph(gid).not_nil!
-        process_composite(g, pp, hint, acc, recurse, chain)
+        process_composite(g, gid, pp, hint, acc, recurse, chain)
       end
 
       chain.delete(gid)
@@ -384,6 +446,22 @@ module TT
       pp[1] = {Fixed.mulfix(pp[1][0], @x_scale), 0_i64}
       pp[2] = {Fixed.mulfix(pp[2][0], @x_scale), Fixed.mulfix(pp[2][1], @y_scale)}
       pp[3] = {Fixed.mulfix(pp[3][0], @x_scale), Fixed.mulfix(pp[3][1], @y_scale)}
+    end
+
+    # TT_Vary_Apply_Glyph_Deltas on a phantom-only "outline" (ttgload.c's
+    # four-element communication structure) — the composite/empty-glyph
+    # path, applied in font units before scaling.
+    private def vary_phantoms(gid : Int32, pp : Array({Int64, Int64})) : Nil
+      blend = @blend
+      return unless blend && @doblend
+
+      xs = Array(Int64).new(4) { |i| pp.unsafe_fetch(i)[0] }
+      ys = Array(Int64).new(4) { |i| pp.unsafe_fetch(i)[1] }
+      d = blend.apply_glyph_deltas(gid, xs, ys, [] of Int32, @normalized,
+                                   blend.has_hvar?, blend.has_vvar?)
+      4.times do |i|
+        pp[i] = {xs.unsafe_fetch(i) &+ d[:dx][i], ys.unsafe_fetch(i) &+ d[:dy][i]}
+      end
     end
 
     private def process_simple(gid : Int32, pp : Array({Int64, Int64}),
@@ -404,15 +482,51 @@ module TT
       cur_x << pp[2][0]; cur_y << pp[2][1]
       cur_x << pp[3][0]; cur_y << pp[3][1]
 
+      # TT_Vary_Apply_Glyph_Deltas on the whole zone (points + phantoms),
+      # in font units, before the orus copy and the scaling (ttgload.c:
+      # "Deltas apply to the unscaled data"). `ux'/`uy' keep the rounded
+      # 26.6-of-font-units value (FT_fixedToFdot6) for the unrounded
+      # scaling below.
+      vary = false
+      ur_x = ur_y = Array(Int64).new(0)
+      if (blend = @blend) && @doblend
+        contours = @scr_glyf_contours
+        d = blend.apply_glyph_deltas(gid, cur_x, cur_y, contours,
+                                     @normalized, blend.has_hvar?,
+                                     blend.has_vvar?)
+        ur_x = Array(Int64).new(n, 0_i64)
+        ur_y = Array(Int64).new(n, 0_i64)
+        n.times do |i|
+          ur_x[i] = (cur_x[i] << 6) &+ d[:ux][i]
+          ur_y[i] = (cur_y[i] << 6) &+ d[:uy][i]
+          cur_x[i] &+= d[:dx][i]
+          cur_y[i] &+= d[:dy][i]
+        end
+        pp[0] = {cur_x[n - 4], cur_y[n - 4]}
+        pp[1] = {cur_x[n - 3], cur_y[n - 3]}
+        pp[2] = {cur_x[n - 2], cur_y[n - 2]}
+        pp[3] = {cur_x[n - 1], cur_y[n - 1]}
+        vary = true
+      end
+
       # orus copy happens BEFORE scaling (font units) when hinted.
       orus_x = @scr_orus_x
       orus_y = @scr_orus_y
       orus_x.clear; orus_x.concat(cur_x)
       orus_y.clear; orus_y.concat(cur_y)
 
-      n.times do |i|
-        cur_x[i] = Fixed.mulfix(cur_x[i], @x_scale)
-        cur_y[i] = Fixed.mulfix(cur_y[i], @y_scale)
+      if vary
+        # a non-default instance scales from the unrounded (16.16-precision)
+        # coordinates, rounding to the nearest 1/64th (ttgload.c)
+        n.times do |i|
+          cur_x[i] = (Fixed.mulfix(ur_x[i], @x_scale) &+ 32) >> 6
+          cur_y[i] = (Fixed.mulfix(ur_y[i], @y_scale) &+ 32) >> 6
+        end
+      else
+        n.times do |i|
+          cur_x[i] = Fixed.mulfix(cur_x[i], @x_scale)
+          cur_y[i] = Fixed.mulfix(cur_y[i], @y_scale)
+        end
       end
 
       tags = @scr_tags
@@ -422,10 +536,30 @@ module TT
       contours = @scr_contours
       contours.clear; contours.concat(@scr_glyf_contours)
 
-      pp[0] = {cur_x[n - 4], cur_y[n - 4]}
-      pp[1] = {cur_x[n - 3], cur_y[n - 3]}
-      pp[2] = {cur_x[n - 2], cur_y[n - 2]}
-      pp[3] = {cur_x[n - 1], cur_y[n - 1]}
+      # phantoms: with HVAR/VVAR and grid-fitting they come from the
+      # unscaled values directly (ttgload.c — "already adjusted but
+      # unscaled"); otherwise from the scaled outline points.
+      if vary && (hb = @blend.not_nil!)
+        if hb.has_hvar? && hint
+          pp[0] = {Fixed.mulfix(pp[0][0], @x_scale), 0_i64}
+          pp[1] = {Fixed.mulfix(pp[1][0], @x_scale), 0_i64}
+        else
+          pp[0] = {cur_x[n - 4], cur_y[n - 4]}
+          pp[1] = {cur_x[n - 3], cur_y[n - 3]}
+        end
+        if hb.has_vvar? && hint
+          pp[2] = {Fixed.mulfix(pp[2][0], @x_scale), Fixed.mulfix(pp[2][1], @y_scale)}
+          pp[3] = {Fixed.mulfix(pp[3][0], @x_scale), Fixed.mulfix(pp[3][1], @y_scale)}
+        else
+          pp[2] = {cur_x[n - 2], cur_y[n - 2]}
+          pp[3] = {cur_x[n - 1], cur_y[n - 1]}
+        end
+      else
+        pp[0] = {cur_x[n - 4], cur_y[n - 4]}
+        pp[1] = {cur_x[n - 3], cur_y[n - 3]}
+        pp[2] = {cur_x[n - 2], cur_y[n - 2]}
+        pp[3] = {cur_x[n - 1], cur_y[n - 1]}
+      end
 
       if hint
         hint_glyph(cur_x, cur_y, tags, contours, n, instructions,
@@ -440,12 +574,54 @@ module TT
       contours.each { |e| acc.contour_ends << e + base }
     end
 
-    private def process_composite(g : CompositeGlyph, pp : Array({Int64, Int64}),
+    private def process_composite(g : CompositeGlyph, gid : Int32,
+                                  pp : Array({Int64, Int64}),
                                   hint : Bool, acc : Acc, recurse : Int32,
                                   chain : Set(Int32)) : Nil
       start_point = acc.n_points
 
-      g.components.each do |comp|
+      # TT_Vary_Apply_Glyph_Deltas on the composite's own "outline": one
+      # point per component (arg1/arg2, font units) plus the scaled
+      # phantoms, with one single-point contour per component. The extra
+      # offsets go into the components' translations (ttgload.c).
+      if (blend = @blend) && @doblend
+        limit = g.components.size
+        xs = Array(Int64).new(limit + 4, 0_i64)
+        ys = Array(Int64).new(limit + 4, 0_i64)
+        g.components.each_with_index do |comp, i|
+          xs[i] = comp.arg1.to_i64
+          ys[i] = comp.arg2.to_i64
+        end
+        4.times do |i|
+          xs[limit + i] = pp.unsafe_fetch(i)[0]
+          ys[limit + i] = pp.unsafe_fetch(i)[1]
+        end
+        contours = Array(Int32).new(limit) { |i| i }
+        d = blend.apply_glyph_deltas(gid, xs, ys, contours, @normalized,
+                                     blend.has_hvar?, blend.has_vvar?)
+        # write back the varied translations (font units, FT_Int16 cast;
+        # anchor-point components ignore theirs — deltas are zero there)
+        comps = g.components.map_with_index do |comp, i|
+          if (comp.flags & ARGS_ARE_XY_VALUES) != 0
+            TT::Component.new(comp.flags, comp.index,
+                              (comp.arg1.to_i64 &+ d[:dx][i]).to_i16!.to_i32,
+                              (comp.arg2.to_i64 &+ d[:dy][i]).to_i16!.to_i32,
+                              comp.transform)
+          else
+            comp
+          end
+        end
+        # phantoms: with HVAR/VVAR the deltas are zeroed, so this is a
+        # no-op exactly when FreeType skips the write-back
+        pp[0] = {xs[limit], ys[limit]}
+        pp[1] = {xs[limit + 1], ys[limit + 1]}
+        pp[2] = {xs[limit + 2], ys[limit + 2]}
+        pp[3] = {xs[limit + 3], ys[limit + 3]}
+      else
+        comps = g.components
+      end
+
+      comps.each do |comp|
         pp_saved = pp.dup
         num_base_points = acc.n_points
 

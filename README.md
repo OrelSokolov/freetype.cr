@@ -73,6 +73,24 @@ render.
   mirrors FT_LOAD_FORCE_AUTOHINT). Segment/edge indices replace the C
   pointer arithmetic; `afblue_data.cr`/`afranges_data.cr` are generated
   from the FreeType sources.
+- `src/tt/ttgxvar.cr` — GX font variations (a 1:1 port of ttgxvar.c):
+  `fvar'/`avar' (+ avar v2 store) parsing with design ↔ normalized
+  coordinate conversion (`GXBlend.from_font'), `gvar' glyph deltas with
+  the packed point/delta decoding, tuple application and IUP-style
+  interpolation (`#apply_glyph_deltas'), and `HVAR'/`VVAR' advance
+  adjustments through the ItemVariationStore/DeltaSetIndexMap machinery
+  (`#advance_delta'). The loader hooks (`HintedFace#set_var_design',
+  the HVAR-adjusted advance, the phantom/component delta calls in
+  src/tt/loader.cr and the non-default-instance scaling from the
+  unrounded 16.16 coordinates) are verified oracle-exact — hinted and
+  unhinted — by spec/var_diff.cr. `cvar' CVT variations (including the
+  `prep' rerun on coordinate changes and the GETVARIATION/GETDATA
+  opcodes) are in place too (spec/var_cvar_diff.cr), as are CFF2
+  variations — the CFF2 table layout, the `blend'/`vsindex' operators in
+  charstrings and Private DICTs (cff_blend_doBlend writes the results
+  back into the operand stack), HVAR advances and the vstore parsing
+  (spec/cff2_var_diff.cr, SourceSerif4Variable); MVAR comes later;
+  `Font#raw_table' hands this module the raw tables.
 - `src/tt/sfnt.cr` — a minimal SFNT parser: head, maxp, hhea, hmtx,
   cmap (formats 4 and 12), loca, glyf, cvt, fpgm, prep, gasp, kern.
   Only what loading outlines and hinting need. WOFF1 wrappers are
@@ -105,7 +123,10 @@ render.
   (header, INDEX structures, charset — needed for seac, FDSelect +
   FDArray, the font-matrix reconciliation from `cffobjs.c`) and the
   DICT operand decoding of `cffparse.c` (integers, 16.16 fixed,
-  binary-coded decimal reals verbatim).
+  binary-coded decimal reals verbatim). CFF2 is parsed too (32-bit
+  INDEX counts, the FDArray-only layout, the VariationStore offset and
+  maxstack), including the Private DICT `blend'/`vsindex' operators —
+  `CFF.build_blend_vector' is the shared cff_blend_build_vector port.
 - `src/cff/cffinterp.cr` — the Type 2 charstring interpreter: a port of
   `psintrp.c` cf2_interpT2CharString (typed int/fixed operand stack,
   width parsing, path/arithmetic operators, flex, seac via endchar, the
@@ -129,7 +150,10 @@ render.
   `cff_slot_load` (cffgload.c) — advance from `hmtx`, FontMatrix →
   translate → FT_MulFix scale in the cffgload.c order — reusing the
   SFNT glue (cmap/hmtx) from `src/tt/sfnt.cr`. Returns the same
-  `TT::LoadedGlyph` as the TrueType loader.
+  `TT::LoadedGlyph` as the TrueType loader. CFF2 faces additionally
+  support `set_var_design': the normalized coordinates drive the
+  charstring/Private DICT blend machinery and the HVAR advance delta,
+  and the Private DICTs are re-blended on coordinate changes.
 
 Note: FreeType hands fonts without bytecode (empty `fpgm`, `prep` ≤ 7
 bytes) to the auto-hinter (ftobjs.c:1016-1020) — so unhinted corpora
@@ -243,8 +267,8 @@ specs; the library itself never calls it):
   matches stock libfreetype (verified glyph-for-glyph). Enabling
   darkening via `FT_Property_Set` would diverge. Subfonts with a
   non-identity FontMatrix still load through the unhinted path.
-- Bare CFF (`.cff` files with their own encoding/charset charmaps) and
-  CFF2 are not parsed — only CFF1 in an SFNT/OTF and WOFF1 (which is
+- Bare CFF (`.cff` files with their own encoding/charset charmaps) is
+  not parsed — only CFF1 and CFF2 in an SFNT/OTF and WOFF1 (which is
   unwrapped to SFNT transparently). WOFF2 is unwrapped too, but only in
   builds with `-Dwith_woff2` (it links libbrotlidec through FFI; the
   reconstruction itself, including the transformed `glyf'/`hmtx', is

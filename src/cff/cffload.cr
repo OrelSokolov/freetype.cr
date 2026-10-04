@@ -9,9 +9,14 @@
 #     binary-coded decimal reals (`cff_parse_real' verbatim, including
 #     the scaling-exponent reconciliation), `cff_parse_font_matrix'.
 #
-# Bare CFF (own encoding/charset charmaps), CFF2, MM/blend operators
-# are intentionally not parsed; the blue/hinting private-dict entries
-# are parsed for the Adobe hinting engine (cffhints.cr).
+# Bare CFF (own encoding/charset charmaps) and multiple-master fonts
+# are intentionally not parsed; CFF2 is (32-bit INDEX counts, the
+# FDArray-only layout, the VariationStore and the `blend'/`vsindex'
+# operators in charstrings and Private DICTs). The blue/hinting
+# private-dict entries are parsed for the Adobe hinting engine
+# (cffhints.cr).
+
+require "../tt/ttgxvar"
 
 module CFF
   class ParseError < Exception
@@ -75,6 +80,12 @@ module CFF
   def self.u16(d : Bytes, p : Int32) : UInt16
     raise ParseError.new("CFF: read past end") if p + 2 > d.size
     (d[p].to_u16 << 8) | d[p + 1]
+  end
+
+  def self.u32(d : Bytes, p : Int32) : UInt32
+    raise ParseError.new("CFF: read past end") if p + 4 > d.size
+    (d[p].to_u32 << 24) | (d[p + 1].to_u32 << 16) |
+      (d[p + 2].to_u32 << 8) | d[p + 3]
   end
 
   # --- DICT operand decoding (cffparse.c) --------------------------------
@@ -323,6 +334,58 @@ module CFF
     out
   end
 
+  # cff_blend_build_vector (cffload.c): the per-region scalars for the
+  # normalized design vector, BV[0] = 1.0 for the default master.
+  # Shared by the charstring interpreter's blend operator and the CFF2
+  # Private DICT re-parse under variations. len_ndv == 0 (no variation
+  # instance set) produces the default vector (1, 0, 0, ...).
+  def self.build_blend_vector(store : TT::ItemVarStore, vsindex : Int32,
+                              ndv : Array(Int64)?) : Array(Int64)
+    len_ndv = ndv.try(&.size) || 0
+    raise ParseError.new("CFF: blend axis count mismatch") \
+      if len_ndv != 0 && len_ndv != store.axis_count
+    raise ParseError.new("CFF: blend vsindex out of range") \
+      if vsindex >= store.var_data.size
+
+    var_data = store.var_data[vsindex]
+    len = var_data.region_indices.size + 1 # + 1 for the default master
+    bv = Array(Int64).new(len, 0_i64)
+    bv[0] = 0x1_0000_i64
+
+    (1...len).each do |master|
+      idx = var_data.region_indices.unsafe_fetch(master - 1)
+      raise ParseError.new("CFF: blend region index out of range") \
+        if idx >= store.region_count
+
+      if len_ndv == 0
+        next # default vector (1, 0, 0, ...)
+      end
+
+      bv[master] = 0x1_0000_i64
+      region = store.regions.unsafe_fetch(idx)
+      len_ndv.times do |j|
+        axis = region.unsafe_fetch(j)
+        ndv_j = ndv.not_nil!.unsafe_fetch(j)
+        if axis.peak_coord == ndv_j || axis.peak_coord == 0
+          next # full contribution, or invalid axis
+        elsif ndv_j <= axis.start_coord || ndv_j >= axis.end_coord
+          bv[master] = 0_i64
+          break
+        elsif ndv_j < axis.peak_coord
+          bv[master] = CFF::Fixed.muldiv(bv[master],
+                                         ndv_j - axis.start_coord,
+                                         axis.peak_coord - axis.start_coord)
+        else
+          bv[master] = CFF::Fixed.muldiv(bv[master],
+                                         axis.end_coord - ndv_j,
+                                         axis.end_coord - axis.peak_coord)
+        end
+      end
+    end
+
+    bv
+  end
+
   # cff_parse_fixed_dynamic: {value 16.16, decimal scaling}.
   def self.parse_fixed_dynamic(d : Bytes, p : Int32, limit : Int32) : {Int64, Int64}
     return parse_real(d, p, limit, 0, true) if d[p] == 30
@@ -405,6 +468,10 @@ module CFF
     property cid_registry : Int64 = 0xFFFF # 0xFFFF = not CID (missing)
     property cid_fd_array_offset : Int64 = 0
     property cid_fd_select_offset : Int64 = 0
+    # CFF2 Top DICT: the VariationStore offset (operator 24) and the
+    # operand stack limit (operator 25, CFF2_DEFAULT_STACK = 513).
+    property vstore_offset : Int64 = 0
+    property maxstack : Int32 = 48
 
     # FontMatrix in 16.16 plus the units_per_em implied by its scaling
     # (cff_parse_font_matrix); `cffobjs.c' normalises both afterwards.
@@ -423,6 +490,8 @@ module CFF
     property nominal_width : Int64 = 0
     property initial_random_seed : Int64 = 0
     property local_subrs : Index?
+    # CFF2 Private DICT: the default ItemVariationData index (operator 22).
+    property vsindex : Int32 = 0
 
     # Hinting entries (cfftoken.h CFF_FIELD_*). Blue arrays are stored
     # delta-decoded in 16.16; BlueScale is value*1000 in 16.16 (the
@@ -469,6 +538,13 @@ module CFF
           @cid_fd_array_offset = CFF.parse_num(d, args[0], d.size) if args.size >= 1
         when 0x125 # FDSelect
           @cid_fd_select_offset = CFF.parse_num(d, args[0], d.size) if args.size >= 1
+        when 24 # vstore (CFF2 only)
+          @vstore_offset = CFF.parse_num(d, args[0], d.size) if args.size >= 1
+        when 25 # maxstack (CFF2 only)
+          if args.size >= 1
+            v = CFF.parse_num(d, args[0], d.size)
+            @maxstack = v.to_i32 if v > 0 && v <= 0xFFFF
+          end
         end
       end
     end
@@ -537,45 +613,83 @@ module CFF
       abs_det <= frob_sq // 32
     end
 
-    def parse_private_dict!(d : Bytes, start : Int32) : Nil
-      dict = Dict.parse(d, start, start + @private_size.to_i32)
-      dict.ops.each do |code, args|
+    # cff_parser_run over the Private DICT: operators consume an operand
+    # *value* stack. Plain operands remember their byte position (pos >= 0)
+    # and are decoded lazily; CFF2 `blend' results live on the stack as
+    # 16.16 fixed numbers (pos < 0), exactly like FreeType's reserved
+    # 255-entries that cff_blend_doBlend writes back into the parser
+    # stack. `blend_store'/`ndv' are set for a CFF2 face with a live
+    # variation instance; without them the dict parses statically.
+    def parse_private_dict!(d : Bytes, start : Int32,
+                            blend_store : TT::ItemVarStore? = nil,
+                            ndv : Array(Int64)? = nil) : Nil
+      limit = start + @private_size.to_i32
+      dict = Dict.parse(d, start, limit)
+
+      vals = [] of {Int32, Int64}
+      bv : Array(Int64)? = nil
+      bv_vsindex = -1
+      vsindex = @vsindex
+
+      dict.ops.each do |code, arg_positions|
+        arg_positions.each { |p| vals << {p, 0_i64} }
         case code
+        when 23 # blend (CFF2 DICT operator 23; 16 is the charstring one):
+          # fold the deltas into the base values
+          if store = blend_store
+            if bv.nil? || bv_vsindex != vsindex
+              bv = CFF.build_blend_vector(store, vsindex, ndv)
+              bv_vsindex = vsindex
+            end
+            blend_vals!(d, limit, vals, bv.not_nil!)
+          end
+        when 22 # vsindex (CFF2 only): the default ItemVariationData index
+          if vals.size >= 1
+            v = pv_num(d, limit, vals[0])
+            if v >= 0
+              vsindex = v.to_i32
+              @vsindex = vsindex
+            end
+          end
         when 19 # Subrs (relative to the Private DICT start)
-          @local_subrs_offset = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
+          @local_subrs_offset = pv_num(d, limit, vals[0]) if vals.size >= 1
         when 20 # defaultWidthX
-          @default_width = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
+          @default_width = pv_num(d, limit, vals[0]) if vals.size >= 1
         when 21 # nominalWidthX
-          @nominal_width = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
+          @nominal_width = pv_num(d, limit, vals[0]) if vals.size >= 1
         when 0x113 # initialRandomSeed
-          @initial_random_seed = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
+          @initial_random_seed = pv_num(d, limit, vals[0]) if vals.size >= 1
         when 6 # BlueValues (delta, 16.16, max 14)
-          @blue_values = CFF.parse_delta_fixed(d, args, start + @private_size.to_i32, 14)
+          @blue_values = pv_delta(d, limit, vals, 14, fixed: true)
         when 7 # OtherBlues (max 10)
-          @other_blues = CFF.parse_delta_fixed(d, args, start + @private_size.to_i32, 10)
+          @other_blues = pv_delta(d, limit, vals, 10, fixed: true)
         when 8 # FamilyBlues (max 14)
-          @family_blues = CFF.parse_delta_fixed(d, args, start + @private_size.to_i32, 14)
+          @family_blues = pv_delta(d, limit, vals, 14, fixed: true)
         when 9 # FamilyOtherBlues (max 10)
-          @family_other_blues = CFF.parse_delta_fixed(d, args, start + @private_size.to_i32, 10)
+          @family_other_blues = pv_delta(d, limit, vals, 10, fixed: true)
         when 0x109 # BlueScale (real, stored *1000)
-          if args.size >= 1
-            @blue_scale = CFF.parse_fixed(d, args[0], start + @private_size.to_i32) &* 1000
+          if vals.size >= 1
+            @blue_scale = pv_fixed(d, limit, vals[0]) &* 1000
           end
         when 0x10A # BlueShift
-          @blue_shift = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
+          @blue_shift = pv_num(d, limit, vals[0]) if vals.size >= 1
         when 0x10B # BlueFuzz
-          @blue_fuzz = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
+          @blue_fuzz = pv_num(d, limit, vals[0]) if vals.size >= 1
         when 10 # StdHW
-          @std_hw = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
+          @std_hw = pv_num(d, limit, vals[0]) if vals.size >= 1
         when 11 # StdVW
-          @std_vw = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
+          @std_vw = pv_num(d, limit, vals[0]) if vals.size >= 1
         when 0x10C # StemSnapH (delta, integers, max 13)
-          @stem_snap_h = CFF.parse_delta_num(d, args, start + @private_size.to_i32, 13)
+          @stem_snap_h = pv_delta(d, limit, vals, 13, fixed: false)
         when 0x10D # StemSnapV
-          @stem_snap_v = CFF.parse_delta_num(d, args, start + @private_size.to_i32, 13)
+          @stem_snap_v = pv_delta(d, limit, vals, 13, fixed: false)
         when 0x111 # LanguageGroup
-          @language_group = CFF.parse_num(d, args[0], start + @private_size.to_i32) if args.size >= 1
+          @language_group = pv_num(d, limit, vals[0]) if vals.size >= 1
         end
+        # cff_parser_run leaves the blended results on the operand stack
+        # for the following field operator (the stack is only cleared for
+        # non-blend fields).
+        vals.clear unless code == 23
       end
 
       # cff_load_private_dict sanitization: an odd BlueValues count
@@ -597,6 +711,73 @@ module CFF
         @initial_random_seed = 987654321
       end
     end
+
+    # cff_parse_num over a value-stack entry: plain operands decode from
+    # `d'; blended entries (pos < 0) round like the reserved-255 decode in
+    # cffparse.c — drop the low byte of the 16.16 value, then round the
+    # top 24 bits and truncate to a signed 16-bit integer.
+    private def pv_num(d : Bytes, limit : Int32, v : {Int32, Int64}) : Int64
+      pos, fixed = v
+      return CFF.parse_num(d, pos, limit) if pos >= 0
+      u = fixed.to_i32!.to_u32!
+      (((u >> 8) &+ 0x80_u32) >> 8).to_u16.to_i16.to_i64
+    end
+
+    # cff_parse_fixed over a value-stack entry: blended entries are
+    # already 16.16 (cff_blend_doBlend writes the full 32-bit sum back).
+    private def pv_fixed(d : Bytes, limit : Int32, v : {Int32, Int64}) : Int64
+      pos, fixed = v
+      return CFF.parse_fixed(d, pos, limit) if pos >= 0
+      fixed.to_i32!.to_i64
+    end
+
+    # cff_parse_delta over value-stack entries: cumulative sums,
+    # truncated to `max' entries before decoding.
+    private def pv_delta(d : Bytes, limit : Int32,
+                         vals : Array({Int32, Int64}), max : Int32,
+                         fixed : Bool) : Array(Int64)
+      out = [] of Int64
+      val = 0_i64
+      vals.first(max).each do |v|
+        val = val &+ (fixed ? pv_fixed(d, limit, v) : pv_num(d, limit, v))
+        out << val
+      end
+      out
+    end
+
+    # cff_blend_doBlend over the Private DICT value stack: the last entry
+    # is `numBlends'; before it sit numBlends base values each followed by
+    # lenBV-1 deltas. Both collapse into `numBlends' 16.16 results, the
+    # sums wrapping at 32 bits exactly like the FT_Fixed arithmetic.
+    private def blend_vals!(d : Bytes, limit : Int32,
+                            vals : Array({Int32, Int64}),
+                            bv : Array(Int64)) : Nil
+      raise ParseError.new("CFF: blend underflow") if vals.empty?
+
+      num_blends = pv_num(d, limit, vals[vals.size - 1])
+      raise ParseError.new("CFF: blend underflow") if num_blends < 0
+
+      len_bv = bv.size
+      count = vals.size - 1
+      num_operands = num_blends &* len_bv
+      raise ParseError.new("CFF: blend underflow") if num_operands > count
+
+      base = (count - num_operands).to_i32
+      delta = base + num_blends.to_i32
+      num_blends.to_i32.times do |i|
+        sum = pv_fixed(d, limit, vals[base + i])
+        (1...len_bv).each do |j|
+          sum = (sum &+ CFF::Fixed.mulfix(bv.unsafe_fetch(j),
+                                          pv_fixed(d, limit, vals[delta])))
+                .to_u32!.to_i32!.to_i64
+          delta += 1
+        end
+        vals[base + i] = {-1, sum}
+      end
+      # leave only the `num_blends' results on the stack (the numBlends
+      # operand goes too: FT sets parser->top = base + numBlends).
+      (num_operands - num_blends + 1).times { vals.pop }
+    end
   end
 
   # --- INDEX (cffload.c cff_index_*) ---------------------------------------
@@ -610,16 +791,19 @@ module CFF
     getter offsets : Array(Int64)
     getter end_pos : Int32 # first position after the whole INDEX
 
-    def self.parse(d : Bytes, start : Int32) : Index
-      count = CFF.u16(d, start).to_i32
+    def self.parse(d : Bytes, start : Int32, cff2 : Bool = false) : Index
+      # CFF2 INDEXes carry a 32-bit count (cff_index_init's cff2 branch).
+      count = cff2 ? CFF.u32(d, start).to_i32 : CFF.u16(d, start).to_i32
+      count_size = cff2 ? 4 : 2
       if count == 0
-        return Index.new(0, start + 2, 0, [] of Int64, start + 2)
+        return Index.new(0, start + count_size, 0, [] of Int64,
+                         start + count_size)
       end
 
-      off_size = CFF.u8(d, start + 2).to_i32
+      off_size = CFF.u8(d, start + count_size).to_i32
       raise ParseError.new("CFF: invalid INDEX offSize") if off_size < 1 || off_size > 4
 
-      offsets_pos = start + 3
+      offsets_pos = start + count_size + 1
       offsets = Array(Int64).new(count + 1) do |i|
         p = offsets_pos + i * off_size
         v = 0_u64
@@ -833,6 +1017,8 @@ module CFF
     getter charset_sids : Array(UInt16) = [] of UInt16
     getter num_glyphs : Int32
     getter cid_keyed : Bool
+    # CFF2 flavor (no Name/String INDEX, FDArray-mandatory, blend ops).
+    getter? cff2 : Bool = false
 
     def initialize(table : Bytes, face_upem : Int32)
       d = table
@@ -840,46 +1026,69 @@ module CFF
       raise ParseError.new("CFF: table too small") if d.size < 4
       version_major = CFF.u8(d, 0)
       hdr_size = CFF.u8(d, 2)
-      abs_off = CFF.u8(d, 3)
-      unless version_major == 1 && hdr_size >= 4 && abs_off <= 4
-        raise ParseError.new("CFF: not a CFF1 font header")
+
+      if version_major == 2
+        # CFF2 header: majorVersion, minorVersion, hdrSize, topDictLength
+        # (u16); no Name/String INDEX — the Top DICT data follow the
+        # header directly, then the global subrs INDEX (cff_font_load).
+        @cff2 = true
+        raise ParseError.new("CFF: not a CFF2 font header") if hdr_size < 5
+        raise ParseError.new("CFF: truncated CFF2 header") if d.size < 5
+        top_dict_len = ((d[3].to_u16 << 8) | d[4]).to_i32
+        raise ParseError.new("CFF: bad CFF2 top dict length") if hdr_size.to_i32 + top_dict_len > d.size
+
+        pos = hdr_size.to_i32
+        @top_font = SubFont.new
+        @top_font.maxstack = 513 # CFF2_DEFAULT_STACK (cffparse.h)
+        top_dict = Dict.parse(d, pos, pos + top_dict_len)
+        @top_font.parse_font_dict!(d, top_dict)
+        pos += top_dict_len
+        @global_subrs = Index.parse(d, pos, true)
+      else
+        @cff2 = false
+        abs_off = CFF.u8(d, 3)
+        unless version_major == 1 && hdr_size >= 4 && abs_off <= 4
+          raise ParseError.new("CFF: not a CFF1 font header")
+        end
+
+        pos = hdr_size.to_i32
+        name_index = Index.parse(d, pos)
+        font_dict_index = Index.parse(d, name_index.end_pos)
+        string_index = Index.parse(d, font_dict_index.end_pos)
+        @global_subrs = Index.parse(d, string_index.end_pos)
+
+        # An SFNT-wrapped CFF holds exactly one font.
+        if name_index.count > 1
+          raise ParseError.new("CFF: multiple subfonts in SFNT wrapper")
+        end
+
+        @top_font = SubFont.new
+        entry = font_dict_index.element(d, 0)
+        raise ParseError.new("CFF: no Top DICT") unless entry
+        top_dict = Dict.parse(d, entry[0], entry[0] + entry[1])
+        @top_font.parse_font_dict!(d, top_dict)
       end
-
-      pos = hdr_size.to_i32
-      name_index = Index.parse(d, pos)
-      font_dict_index = Index.parse(d, name_index.end_pos)
-      string_index = Index.parse(d, font_dict_index.end_pos)
-      @global_subrs = Index.parse(d, string_index.end_pos)
-
-      # An SFNT-wrapped CFF holds exactly one font.
-      if name_index.count > 1
-        raise ParseError.new("CFF: multiple subfonts in SFNT wrapper")
-      end
-
-      @top_font = SubFont.new
-      entry = font_dict_index.element(d, 0)
-      raise ParseError.new("CFF: no Top DICT") unless entry
-      top_dict = Dict.parse(d, entry[0], entry[0] + entry[1])
-      @top_font.parse_font_dict!(d, top_dict)
 
       raise ParseError.new("CFF: no charstrings offset") if @top_font.charstrings_offset == 0
-      @charstrings = Index.parse(d, @top_font.charstrings_offset.to_i32)
+      @charstrings = Index.parse(d, @top_font.charstrings_offset.to_i32, @cff2)
       @num_glyphs = @charstrings.count
 
-      @cid_keyed = @top_font.cid_registry != 0xFFFF
+      @cid_keyed = @cff2 || @top_font.cid_registry != 0xFFFF
       if @cid_keyed
-        # CID-keyed: private dicts live in the FDArray subfonts; the top
-        # private dict is not loaded (cff_subfont_load stops for CID tops).
-        fd_index = Index.parse(d, @top_font.cid_fd_array_offset.to_i32)
+        # CFF2 always resolves through the FDArray (its top DICT has no
+        # Private); CID-keyed CFF1 does the same via ROS.
+        fd_index = Index.parse(d, @top_font.cid_fd_array_offset.to_i32, @cff2)
         fd_index.count.times do |i|
           sub = SubFont.new
+          sub.maxstack = @top_font.maxstack
           if e = fd_index.element(d, i)
             sub.parse_font_dict!(d, Dict.parse(d, e[0], e[0] + e[1]))
           end
           load_private_dict(d, sub)
           @subfonts << sub
         end
-        if @num_glyphs > 0
+        # CFF2 omits FDSelect when there is exactly one FD (cffload.c).
+        if @num_glyphs > 0 && (!@cff2 || fd_index.count > 1)
           @fd_select = FdSelect.parse(d, @num_glyphs,
             @top_font.cid_fd_select_offset.to_i32)
         end
@@ -887,7 +1096,8 @@ module CFF
         load_private_dict(d, @top_font)
       end
 
-      @charset_sids = load_charset(d, @top_font.charset_offset) if @num_glyphs > 0
+      # CFF2 has no charset (glyph names do not exist; seac neither).
+      @charset_sids = @cff2 ? Array(UInt16).new(0) : (load_charset(d, @top_font.charset_offset) if @num_glyphs > 0) || Array(UInt16).new(0)
       normalize_matrices(face_upem)
     end
 
@@ -918,7 +1128,8 @@ module CFF
         sub.parse_private_dict!(d, sub.private_offset.to_i32)
         if sub.local_subrs_offset != 0
           sub.local_subrs = Index.parse(
-            d, sub.private_offset.to_i32 + sub.local_subrs_offset.to_i32)
+            d, sub.private_offset.to_i32 + sub.local_subrs_offset.to_i32,
+            @cff2)
         end
       end
       # RNG seed: FreeType seeds from an address-derived driver value
@@ -926,6 +1137,23 @@ module CFF
       # InitialRandomSeed, which is what FT falls back to when the
       # driver seed is zero.
       sub.random = sub.initial_random_seed.to_u32!
+    end
+
+    # CFF2: re-parse the Private DICTs under the current variation
+    # instance so the `blend' operator inside them takes effect on the
+    # hinting entries (BlueValues, Std*VW/H, StemSnap). FreeType re-parses
+    # whenever the blend vector changes; coordinates only change through
+    # the face's set_var_design, so reblending there is equivalent.
+    # Local subrs/offsets are layout, not values — untouched.
+    def reblend_private_dicts(store : TT::ItemVarStore?,
+                              ndv : Array(Int64)?) : Nil
+      return unless store
+      subs = @subfonts.dup
+      subs << @top_font
+      subs.each do |sub|
+        next if sub.private_offset == 0 || sub.private_size == 0
+        sub.parse_private_dict!(@data, sub.private_offset.to_i32, store, ndv)
+      end
     end
 
     # cff_charset_load: gid -> SID (identity ISOAdobe, Expert and

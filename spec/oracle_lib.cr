@@ -95,6 +95,8 @@ lib LibFT
   fun get_char_index = FT_Get_Char_Index(face : FaceRec*, char_code : UInt32) : UInt32
   fun load_glyph = FT_Load_Glyph(face : FaceRec*, glyph_index : UInt32,
                                  load_flags : Int32) : Int32
+  fun set_var_design = FT_Set_Var_Design_Coordinates(face : FaceRec*, num_coords : UInt32,
+                                                     coords : Long*) : Int32
   fun render_glyph = FT_Render_Glyph(slot : GlyphSlotRec*, render_mode : Int32) : Int32
   fun done_face = FT_Done_Face(face : FaceRec*) : Int32
   fun done_free_type = FT_Done_FreeType(library : Void*) : Int32

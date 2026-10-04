@@ -9,8 +9,9 @@
 #     `prep', `cmap' (formats 4/12, FT's default-charmap selection) and
 #     `kern' (legacy format 0) for codepoint lookup and kerning.
 #
-# Only what the pipeline needs is parsed; variations (fvar/gvar), embedded
-# bitmaps and hdmx are intentionally out of scope. WOFF1 wrappers are
+# Only what the pipeline needs is parsed; embedded bitmaps and hdmx are
+# intentionally out of scope, and the variation tables (fvar/avar/gvar…)
+# live in tt/ttgxvar.cr (reached through `Font#raw_table'). WOFF1 wrappers are
 # unwrapped into a plain SFNT before parsing (see `TT.unwrap_woff');
 # WOFF2 too when built with -Dwith_woff2 (see tt/woff2.cr).
 
@@ -364,6 +365,7 @@ module TT
     getter max_functions : Int32
     getter max_instruction_defs : Int32
     getter max_stack : Int32
+    getter max_size_of_instructions : Int32
     getter cvt : Array(Int32) # raw font units
     getter fpgm : Bytes
     getter prep : Bytes
@@ -373,6 +375,7 @@ module TT
     getter cff_table : Bytes = Bytes.new(0)
 
     @data : Bytes
+    @tables : Hash(String, Tuple(Int32, Int32))
     @glyf : Bytes = Bytes.new(0)
     @loca : Bytes = Bytes.new(0)
     @hmtx : Bytes = Bytes.new(0)
@@ -394,7 +397,8 @@ module TT
       raise ParseError.new("not an SFNT font (too small)") if d.size < @base + 12
 
       num_tables = u16(d, @base + 4)
-      tables = Hash(String, Tuple(Int32, Int32)).new
+      @tables = Hash(String, Tuple(Int32, Int32)).new
+      tables = @tables
       i = 0
       while i < num_tables
         off = @base + 12 + 16*i
@@ -430,10 +434,12 @@ module TT
         @max_functions = u16(d, maxp[0] + 20).to_i32
         @max_instruction_defs = u16(d, maxp[0] + 22).to_i32
         @max_stack = u16(d, maxp[0] + 24).to_i32
+        @max_size_of_instructions = u16(d, maxp[0] + 26).to_i32
       else
         # version 0.5 (CFF-flavoured) or truncated: interpreter maxima = 0
         @max_points = @max_contours = @max_twilight = 0
         @max_storage = @max_functions = @max_instruction_defs = @max_stack = 0
+        @max_size_of_instructions = 0
       end
 
       hhea = table(tables, "hhea")
@@ -473,12 +479,13 @@ module TT
         @typo_ascender = @typo_descender = 0
       end
 
-      # CFF-flavoured OTF carries no glyf/loca: hand the raw 'CFF ' table
-      # to the CFF pipeline (src/cff) and keep the SFNT side (cmap/hmtx/
-      # head) working for it. Bitmap-only fonts (CBDT/sbix/CBLC) stay out
-      # of scope — reject them up front as before.
-      if cff_entry = tables["CFF "]?
-        @cff_table = slice(tables, "CFF ")
+      # CFF-flavoured OTF carries no glyf/loca: hand the raw 'CFF '/'CFF2'
+      # table to the CFF pipeline (src/cff) and keep the SFNT side
+      # (cmap/hmtx/head) working for it. Bitmap-only fonts (CBDT/sbix/CBLC)
+      # stay out of scope — reject them up front as before.
+      if cff_entry = tables["CFF "]? || tables["CFF2"]?
+        tag = tables.has_key?("CFF ") ? "CFF " : "CFF2"
+        @cff_table = slice(tables, tag)
       elsif tables.has_key?("glyf") && tables.has_key?("loca")
         @loca = slice(tables, "loca")
         @glyf = slice(tables, "glyf")
@@ -496,6 +503,16 @@ module TT
       parse_cmap(tables)
       parse_kern(tables)
       compute_vertical_face_metrics
+    end
+
+    # Raw table bytes by tag (nil when absent/out of bounds) — the entry
+    # point for the optional variation tables (see tt/ttgxvar.cr).
+    def raw_table(tag : String) : Bytes?
+      entry = @tables[tag]?
+      return nil unless entry
+      off, len = entry
+      return nil if off < 0 || len < 0 || off + len > @data.size
+      @data[off, len]
     end
 
     # Codepoint -> glyph index through the selected Unicode submap.

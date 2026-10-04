@@ -18,6 +18,7 @@
 
 require "./cffload"
 require "./cffhints"
+require "../tt/ttgxvar"
 
 module CFF
   class InterpError < Exception
@@ -365,6 +366,11 @@ module CFF
 
     getter vals : Array(Num) = [] of Num
     property error : String? = nil
+    @limit : Int32
+
+    def initialize(limit : Int32 = 48)
+      @limit = limit
+    end
 
     def size : Int32
       @vals.size
@@ -375,7 +381,7 @@ module CFF
     end
 
     def push_int(v : Int32) : Nil
-      if @vals.size >= 48
+      if @vals.size >= @limit
         CFF.trace("stack overflow push_int(#{v})") if CFF.trace?
         @error = "stack overflow"
         return
@@ -384,7 +390,7 @@ module CFF
     end
 
     def push_fixed(v : Int64) : Nil
-      if @vals.size >= 48
+      if @vals.size >= @limit
         CFF.trace("stack overflow push_fixed(#{v})") if CFF.trace?
         @error = "stack overflow"
         return
@@ -527,6 +533,16 @@ module CFF
     @v_stem_hints : Array(StemHint) = [] of StemHint
     @hint_mask : HintMask = HintMask.new
     @hint_origin_y : Int64 = 0_i64
+    # CFF2 blending state (psintrp.c font->blend): the VariationStore,
+    # the normalized design vector, the current blend vector and its
+    # cache parameters (cff_blend_check_vector / _build_vector).
+    @blend_store : TT::ItemVarStore?
+    @ndv : Array(Int64)?
+    @vsindex : Int32 = 0
+    @bv : Array(Int64) = [] of Int64
+    @bv_vsindex : Int32 = -1
+    @bv_ndv : Array(Int64) = [] of Int64
+    @used_bv : Bool = false
 
     private def add32(a : Int64, b : Int64) : Int64
       CFF.add32(a, b)
@@ -537,12 +553,18 @@ module CFF
     end
 
     def initialize(font : Font, builder : Builder, @subfont : SubFont,
-                   hinted : Bool = false, scale : Int64 = 0x0400_i64)
+                   hinted : Bool = false, scale : Int64 = 0x0400_i64,
+                   blend_store : TT::ItemVarStore? = nil,
+                   ndv : Array(Int64)? = nil)
       @font = font
       @data = font.data
       @builder = builder
       @hinted = hinted
       @hint_scale = scale
+      @blend_store = blend_store
+      @ndv = ndv
+      @vsindex = @subfont.vsindex
+      @stack = OpStack.new(@font.cff2? ? @font.top_font.maxstack : 48)
       if hinted
         @path = GlyphPath.new(builder, hinted: true, scale_x: scale,
                               scale_y: scale, h_stems: @h_stem_hints,
@@ -551,7 +573,6 @@ module CFF
       else
         @path = GlyphPath.new(builder)
       end
-      @stack = OpStack.new
       @storage = Array(Int64).new(32, 0_i64)
       @buffers = [] of Buf
     end
@@ -563,7 +584,9 @@ module CFF
       @buffers = [Buf.new(@data, start, start + len)]
       @cur_x = cur_x
       @cur_y = cur_y
-      @have_width = false
+      # CFF2 charstrings never encode a width (psintrp.c: haveWidth starts
+      # TRUE for isCFF2); the advance always comes from `hmtx'.
+      @have_width = @font.cff2?
       @width = @subfont.default_width << 16
       @h_stems = 0
       @v_stems = 0
@@ -579,6 +602,46 @@ module CFF
       interpret(doing_seac)
       # cf2_setGlyphWidth: *decoder->glyph_width = cf2_fixedToInt(width)
       ((@width.to_u32! &+ 0x8000_u32) >> 16).to_u16.to_i16.to_i32
+    end
+
+    # cf2_doBlend: blend `num_blends' operand groups on the stack using
+    # the current blend vector, leaving only the results.
+    private def do_blend(num_blends : Int32) : Nil
+      len_bv = @bv.size
+      num_operands = num_blends * len_bv
+      raise InterpError.new("blend underflow") if num_operands > @stack.size || num_blends < 0
+
+      base = @stack.size - num_operands
+      delta = base + num_blends
+      num_blends.times do |i|
+        sum = @stack.get_real(base + i)
+        (1...len_bv).each do |j|
+          sum = add32(sum, CFF::Fixed.mulfix(@bv.unsafe_fetch(j),
+                                             @stack.get_real(delta)))
+          delta += 1
+        end
+        @stack.set_real(base + i, sum)
+      end
+      # leave only the `num_blends' results on the stack
+      (num_operands - num_blends).times { @stack.vals.pop }
+    end
+
+    # cff_blend_check_vector: whether the cached blend vector must be
+    # rebuilt for `vsindex'.
+    private def blend_vector_stale?(vsindex : Int32) : Bool
+      @bv.empty? || @bv_vsindex != vsindex || @bv_ndv != (@ndv || [] of Int64)
+    end
+
+    # cff_blend_build_vector (cffload.c): shared with the Private DICT
+    # re-parse — see CFF.build_blend_vector in cffload.cr.
+    private def build_blend_vector(store : TT::ItemVarStore, vsindex : Int32) : Nil
+      begin
+        @bv = CFF.build_blend_vector(store, vsindex, @ndv)
+      rescue ex : ParseError
+        raise InterpError.new(ex.message)
+      end
+      @bv_vsindex = vsindex
+      @bv_ndv = @ndv ? @ndv.not_nil!.dup : Array(Int64).new(0)
     end
 
     private def buf : Buf
@@ -605,15 +668,37 @@ module CFF
 
         if CFF.trace?
           pos = buf.pos - 1
+          s = @stack.size
+          top = s > 8 ? 8 : s
+          stackvals = (1..top).map { |n| @stack.get_real(s - n) }
           CFF.trace("lvl=#{@buffers.size - 1} pos=#{pos} op=#{op1} " \
-                    "nstack=#{@stack.size} cur=#{@cur_x},#{@cur_y}")
+                    "nstack=#{s} #{stackvals} cur=#{@cur_x},#{@cur_y}")
         end
 
         case op1
         when 0, 2, 17, 9, 13 # reserved (9/13: T1-only ops)
           # unknown op — clear the stack
-        when 15 # vsindex: CFF1 ignores
-        when 16 # blend: CFF1 ignores
+        when 15 # vsindex (CFF2 only; CFF1 ignores)
+          if @font.cff2?
+            raise InterpError.new("vsindex after blend") if @used_bv
+            temp = @stack.pop_int
+            check_stack_error
+            @vsindex = temp if temp >= 0
+          end
+        when 16 # blend (CFF2 only; CFF1 ignores)
+          if @font.cff2?
+            store = @blend_store
+            raise InterpError.new("blend in a non-variant font") unless store
+            if blend_vector_stale?(@vsindex)
+              build_blend_vector(store, @vsindex)
+            end
+            num_blends = @stack.pop_int
+            check_stack_error
+            do_blend(num_blends)
+            check_stack_error
+            @used_bv = true
+            next # do not clear the stack
+          end
         when 1, 18 # hstem, hstemhm
           if @hintmask_valid
             # never add hints after the mask is computed

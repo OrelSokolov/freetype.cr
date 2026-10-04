@@ -19,6 +19,7 @@
 
 require "../tt/sfnt"
 require "../tt/loader" # TT::LoadedGlyph
+require "../tt/ttgxvar"
 require "./cffload"
 require "./cffinterp"
 
@@ -29,6 +30,11 @@ module CFF
 
     @px : Int32 = 0
     @x_scale : Int64 = 0_i64
+    @blend : TT::GXBlend?
+    @doblend : Bool = false
+    @design_coords : Array(Int64) = [] of Int64
+    @normalized : Array(Int64) = [] of Int64
+    @vstore : TT::ItemVarStore?
 
     def initialize(data : Bytes, face_index : Int32 = 0)
       # Same buffer-copy rationale as TT::HintedFace.
@@ -36,6 +42,13 @@ module CFF
       raise ParseError.new("not a CFF-flavoured font (no 'CFF ' table)") \
         if @font.cff_table.empty?
       @cff = Font.new(@font.cff_table, @font.upem)
+
+      # cff_font_load parses the CFF2 VariationStore unconditionally (a
+      # u16 length precedes the ItemVariationStore); the axis-count cross
+      # check happens per blend against the fvar axes.
+      if @cff.cff2? && (off = @cff.top_font.vstore_offset) > 0
+        @vstore = TT::ItemVarStore.load(@cff.data, off + 2, 0) rescue nil
+      end
     end
 
     def num_glyphs : Int32
@@ -64,6 +77,32 @@ module CFF
       @x_scale
     end
 
+    # FT_Set_Var_Design_Coordinates for a CFF2 face: normalize the design
+    # coordinates through `fvar'/`avar' and make the CFF2 VariationStore
+    # available to the charstring interpreter's blend operator. A no-op
+    # for CFF1 faces and static fonts.
+    def set_var_design(coords : Array(Int64)) : Nil
+      blend = (@blend ||= TT::GXBlend.from_font(@font) rescue nil)
+      return if blend.nil?
+      n = {coords.size, blend.num_axis}.min
+      cs = Array(Int64).new(blend.num_axis, 0_i64)
+      blend.num_axis.times do |i|
+        cs[i] = i < n ? coords.unsafe_fetch(i) : blend.axis[i].default
+      end
+      @design_coords = cs
+      @normalized = blend.to_normalized(cs)
+      @doblend = true
+      # The CFF2 Private DICTs blend their hinting entries through the
+      # VariationStore (cff_blend_doBlend); FreeType re-parses them
+      # whenever the blend vector changes.
+      @cff.reblend_private_dicts(@vstore, @normalized)
+    end
+
+    # The current design coordinates (empty for a static/unset face).
+    def var_design_coords : Array(Int64)
+      @design_coords.dup
+    end
+
     # The FT_LOAD_NO_SCALE variant of the unhinted load — what the
     # auto-hinter feeds on: the font-unit outline (FontMatrix/offset
     # applied exactly as in the scaled unhinted path, minus the final
@@ -75,7 +114,9 @@ module CFF
 
       begin
         if entry = @cff.charstring(gid)
-          interp = Interpreter.new(@cff, builder, subfont)
+          interp = Interpreter.new(@cff, builder, subfont,
+                                   blend_store: @vstore,
+                                   ndv: @doblend ? @normalized : nil)
           glyph_width = interp.run(entry[0], entry[1], false, 0_i64, 0_i64)
           builder.close_contour
         end
@@ -159,9 +200,13 @@ module CFF
             # cf2_getScaleAndHintFlag: (x_scale + 32) / 64 — the Adobe
             # engine then emits 26.6 device space directly.
             hint_scale = (x_scale &+ 32) // 64
-            interp = Interpreter.new(@cff, builder, subfont, true, hint_scale)
+            interp = Interpreter.new(@cff, builder, subfont, true, hint_scale,
+                                     blend_store: @vstore,
+                                     ndv: @doblend ? @normalized : nil)
           else
-            interp = Interpreter.new(@cff, builder, subfont)
+            interp = Interpreter.new(@cff, builder, subfont,
+                                     blend_store: @vstore,
+                                     ndv: @doblend ? @normalized : nil)
           end
           glyph_width = interp.run(entry[0], entry[1], false, 0_i64, 0_i64)
           # cf2_outline_close: one final close of the last contour (the
@@ -174,12 +219,17 @@ module CFF
                                    [] of Int32, 0_i64)
       end
 
-      # Now set the metrics (cffgload.c): the advance comes from hmtx.
+      # Now set the metrics (cffgload.c): the advance comes from hmtx,
+      # adjusted by `HVAR' for a variation instance (the CFF driver uses
+      # the same sfnt metrics-variations service as the TrueType one).
       advance : Int64
       if @font.num_h_metrics > 0
         advance = @font.h_metrics(gid)[0].to_i64
       else
         advance = glyph_width.to_i64
+      end
+      if (blend = @blend) && @doblend && blend.has_hvar?
+        advance &+= blend.advance_delta(gid, @normalized)
       end
 
       xs = builder.xs
