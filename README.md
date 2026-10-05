@@ -111,9 +111,18 @@ render.
   integer formats, brotli decompression of the table stream and the
   reconstruction of transformed `glyf'/`loca' (triplet decoding,
   bbox/nPoints/nContour substreams, composite glyphs) and `hmtx'.
-  Opt-in: the file (and the libbrotlidec link) is only compiled with
+  Opt-in: the file (and the brotli decoder) is only compiled with
   `-Dwith_woff2`; without the flag a `.woff2` buffer raises a ParseError
-  saying so. The default build gains no C dependency.
+  saying so. The default build gains no C dependency. **Caveat: only
+  build with `-Dwith_woff2` if you actually load `.woff2` buffers** —
+  the brotli decoder is slow to compile **in release mode only** (about
+  10 minutes, cold compiler cache; non-release builds compile at the
+  usual speed), while the default build is fast. The
+  brotli backend is selectable at compile time: the pure-Crystal decoder
+  shard [brotli.cr](https://github.com/OrelSokolov/brotli.cr) by
+  default, or libbrotlidec through FFI by adding `-Dnative_brotli` (an
+  all-C reference build that compiles much faster; both pass the same
+  WOFF2 acceptance diff).
 - `src/tt/loader.cr` — a port of the hint glue from `ttgload.c`/
   `ttobjs.c`: scaling, `exec.run_fpgm`/`run_prep` (CVT in 26.6, as in
   C), `backward_compatibility`, simple and composite glyph loading,
@@ -202,6 +211,16 @@ renders through the same `Ftrender` as the TrueType path. `hint: true`
 (default in FT terms: FT_LOAD_DEFAULT) runs the ported Adobe hinting
 engine — bit-exact against it.
 
+WOFF2 (`.woff2` webfonts) is opt-in: build with `-Dwith_woff2` (plus
+`-Dnative_brotli` for the libbrotlidec FFI backend instead of the
+pure-Crystal [brotli.cr](https://github.com/OrelSokolov/brotli.cr)
+decoder). **Only do so if you actually load `.woff2` buffers** — pulling
+in the brotli decoder makes **release** (`--release`) compilation
+extremely slow (~10 minutes on a cold compiler cache); non-release
+builds are unaffected and compile at the usual speed. Without the flags
+the build stays fast and `.woff2` raises a ParseError. WOFF1 (`.woff`) needs no flags —
+it is always compiled (stdlib zlib).
+
 ## Accuracy
 
 Verified with an oracle-diff against the system libfreetype (FFI in the
@@ -275,9 +294,12 @@ specs; the library itself never calls it):
 - Bare CFF (`.cff` files with their own encoding/charset charmaps) is
   not parsed — only CFF1 and CFF2 in an SFNT/OTF and WOFF1 (which is
   unwrapped to SFNT transparently). WOFF2 is unwrapped too, but only in
-  builds with `-Dwith_woff2` (it links libbrotlidec through FFI; the
-  reconstruction itself, including the transformed `glyf'/`hmtx', is
-  pure Crystal). CFF2 charstring transforms are rejected.
+  builds with `-Dwith_woff2` (the brotli decoder is compiled in only
+  under that flag — the default build never pulls it in; the backend is
+  the pure-Crystal brotli.cr shard, or libbrotlidec through FFI with the
+  additional `-Dnative_brotli`; the reconstruction itself, including the
+  transformed `glyf'/`hmtx', is pure Crystal). CFF2 charstring transforms
+  are rejected.
 - CID (FDArray/FDSelect) is implemented and oracle-verified on
   Noto Sans CJK JP; other CID fonts passed through the same code path,
   but that is the only CID font in the acceptance corpus.

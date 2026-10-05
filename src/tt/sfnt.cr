@@ -18,8 +18,10 @@
 require "compress/zlib"
 require "io/memory"
 
-# WOFF2 support is opt-in: it pulls in libbrotli through FFI, so it is
-# only compiled (and linked) when the `with_woff2' flag is given.
+# WOFF2 support is opt-in and only compiled when the `with_woff2' flag is
+# given; the brotli backend is then chosen at compile time — the
+# pure-Crystal decoder shard by default, libbrotlidec through FFI with
+# the additional -Dnative_brotli flag (see tt/woff2.cr).
 {% if flag?(:with_woff2) %}
 require "./woff2"
 {% end %}
@@ -219,8 +221,9 @@ module TT
   # stored raw (compLength == origLength) or zlib-compressed; the
   # result is a reconstructed SFNT with the original flavor, a fresh
   # table directory and the tables re-padded to 4-byte alignment.
-  # WOFF2 ('wOF2' magic) is unwrapped through libbrotli when built with
-  # -Dwith_woff2 (see tt/woff2.cr); without the flag it is an error.
+  # WOFF2 ('wOF2' magic) is unwrapped through the pure-Crystal brotli
+  # decoder when built with -Dwith_woff2 (see tt/woff2.cr); without the
+  # flag it is an error.
   # Bare collections ('ttcf') are returned as-is — they are handled
   # through `ttcf_face_offset'/`Font#@base' instead (slicing would
   # corrupt their file-relative table offsets). Any other input is
@@ -233,7 +236,7 @@ module TT
         return TT.unwrap_woff2(data, face_index)
       {% else %}
         raise ParseError.new("WOFF2 fonts require a build with " \
-                             "-Dwith_woff2 (libbrotli)")
+                             "-Dwith_woff2 (brotli)")
       {% end %}
     end
 

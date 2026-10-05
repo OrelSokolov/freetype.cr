@@ -1,9 +1,14 @@
-# WOFF2 unwrapping through libbrotli (FFI).
+# WOFF2 unwrapping with a selectable brotli backend.
 #
 # The whole file is only compiled when the `with_woff2' compile-time flag
-# is given (`crystal build -Dwith_woff2 ...'), so the default build never
-# links against libbrotli. Trying to load a WOFF2 font without the flag
-# raises a ParseError pointing at the flag (see `TT.unwrap_woff').
+# is given (`crystal build -Dwith_woff2 ...'), keeping the default build
+# free of the brotli decoder. Trying to load a WOFF2 font without the flag
+# raises a ParseError pointing at the flag (see `TT.unwrap_woff'). The
+# backend is chosen at compile time:
+#
+#   * default: the pure-Crystal decoder shard brotli.cr
+#   * -Dnative_brotli (together with -Dwith_woff2): libbrotlidec through
+#     FFI, for an all-C reference build
 #
 # This is a port of FreeType's sfnt/sfwoff2.c (`woff2_open_font' plus the
 # glyf/loca/hmtx reconstruction). WOFF2 collections (flavor 'ttcf') are
@@ -11,6 +16,7 @@
 # CFF2 charstring transforms are rejected as unknown transforms, matching
 # what our pipeline supports. Spec: https://www.w3.org/TR/WOFF2/
 
+{% if flag?(:native_brotli) %}
 @[Link("brotlidec")]
 lib LibBrotli
   fun decompress = BrotliDecoderDecompress(encoded_size : LibC::SizeT,
@@ -18,6 +24,9 @@ lib LibBrotli
                                            decoded_size : LibC::SizeT*,
                                            decoded_buffer : UInt8*) : Int32
 end
+{% else %}
+require "brotli"
+{% end %}
 
 module TT
   # WOFF2 known table tags, in the order given by the spec's table
@@ -365,23 +374,49 @@ module TT
     raise ParseError.new("WOFF2 expands beyond the size limit") if
       uncompressed_size > WOFF2_MAX_SFNT_SIZE
 
-    # Decompress the brotli stream into the table stream.
+    # Decompress the brotli stream into the table stream, through the
+    # compile-time selected backend (w2_brotli_decode below).
     raise ParseError.new("WOFF2 compressed data out of bounds") if
       compressed_offset.to_u64 + total_compressed_size > data.size
-    uncompressed = Bytes.new(uncompressed_size)
-    decoded_size = LibC::SizeT.new(uncompressed_size)
-    result = LibBrotli.decompress(LibC::SizeT.new(total_compressed_size),
-                                  data.to_unsafe + compressed_offset,
-                                  pointerof(decoded_size),
-                                  uncompressed.to_unsafe)
-    unless result == 1 && decoded_size == uncompressed_size # BROTLI_DECODER_RESULT_SUCCESS
-      raise ParseError.new("WOFF2 brotli stream length mismatch")
-    end
+    uncompressed = w2_brotli_decode(data, compressed_offset,
+                                    total_compressed_size, uncompressed_size)
 
     w2_reconstruct_font(uncompressed, tables, flavor)
   end
 
   ################################################################################
+
+  # Decode the WOFF2 brotli stream `data[offset, size]' into exactly
+  # `uncompressed_size' bytes; either a ParseError or a wrong length
+  # reports the same stream mismatch FreeType does. The backend is
+  # selected at compile time (see the file header).
+  {% if flag?(:native_brotli) %}
+  private def self.w2_brotli_decode(data : Bytes, offset : Int32,
+                                    size : UInt32, uncompressed_size : Int64) : Bytes
+    uncompressed = Bytes.new(uncompressed_size)
+    decoded_size = LibC::SizeT.new(uncompressed_size)
+    result = LibBrotli.decompress(LibC::SizeT.new(size),
+                                  data.to_unsafe + offset,
+                                  pointerof(decoded_size),
+                                  uncompressed.to_unsafe)
+    unless result == 1 && decoded_size == uncompressed_size # BROTLI_DECODER_RESULT_SUCCESS
+      raise ParseError.new("WOFF2 brotli stream length mismatch")
+    end
+    uncompressed
+  end
+  {% else %}
+  private def self.w2_brotli_decode(data : Bytes, offset : Int32,
+                                    size : UInt32, uncompressed_size : Int64) : Bytes
+    uncompressed = begin
+      Brotli::Decoder.new.decode(data[offset, size])
+    rescue Brotli::DecodeError
+      raise ParseError.new("WOFF2 brotli stream length mismatch")
+    end
+    raise ParseError.new("WOFF2 brotli stream length mismatch") if
+      uncompressed.size != uncompressed_size
+    uncompressed
+  end
+  {% end %}
 
   # Rebuild a plain SFNT from the decompressed WOFF2 table stream; port
   # of `reconstruct_font' (sfwoff2.c). Tables come out sorted by tag with

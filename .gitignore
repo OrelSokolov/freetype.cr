@@ -18,3 +18,7 @@
 /tmp_c/trig_oracle
 /tmp_check/
 trace_*.txt
+
+# shards checkout + lock (not committed for a library shard)
+/lib/
+/shard.lock

@@ -1,10 +1,11 @@
 # WOFF2 acceptance test: unwrap real .woff2 webfonts through
-# TT.unwrap_woff2 (brotli via FFI + glyf/loca/hmtx reconstruction) and
-# diff both the hinted and unhinted pipelines against the system
-# FreeType loading the same .woff2 file.
+# TT.unwrap_woff2 (pure-Crystal brotli decoder + glyf/loca/hmtx
+# reconstruction) and diff both the hinted and unhinted pipelines against
+# the system FreeType loading the same .woff2 file.
 #
 # Requirements (all opt-in, this spec is not part of the default CI):
-#   * build with -Dwith_woff2 (links libbrotlidec)
+#   * build with -Dwith_woff2 (pulls in the brotli shard; add
+#     -Dnative_brotli to use libbrotlidec through FFI instead)
 #   * the oracle FreeType must be built with brotli (the system
 #     libfreetype on Debian/Ubuntu has it; the CI oracle tarball build
 #     in .github/workflows/ci.yml deliberately has it disabled)

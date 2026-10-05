@@ -10,3 +10,7 @@ license: MIT
 repository: https://github.com/OrelSokolov/freetype.cr
 authors:
   - Oleg Orlov <orelcokolov@gmail.com>
+
+dependencies:
+  brotli:
+    git: https://github.com/OrelSokolov/brotli.cr.git
