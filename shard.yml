@@ -14,3 +14,4 @@ authors:
 dependencies:
   brotli:
     git: https://github.com/OrelSokolov/brotli.cr.git
+    version: ">= 0.2.0"
