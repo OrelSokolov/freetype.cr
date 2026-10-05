@@ -3,18 +3,17 @@
 # reconstruction) and diff both the hinted and unhinted pipelines against
 # the system FreeType loading the same .woff2 file.
 #
-# Requirements (all opt-in, this spec is not part of the default CI):
-#   * build with -Dwith_woff2 (pulls in the brotli shard; add
-#     -Dnative_brotli to use libbrotlidec through FFI instead)
+# Requirements (this spec is not part of the default CI):
+#   * WOFF2 is compiled in by default (add -Dnative_brotli to use
+#     libbrotlidec through FFI instead of the brotli shard)
 #   * the oracle FreeType must be built with brotli (the system
 #     libfreetype on Debian/Ubuntu has it; the CI oracle tarball build
 #     in .github/workflows/ci.yml deliberately has it disabled)
 #   * a corpus of .woff2 files in tmp_check/w2_*.woff2 (e.g. fetched
 #     from Google Fonts; see README)
 #
-# Run: crystal run --release -Dwith_woff2 spec/woff2_diff.cr
+# Run: crystal run --release spec/woff2_diff.cr
 
-{% if flag?(:with_woff2) %}
 require "./oracle_lib"
 require "../src/tt/loader"
 require "../src/ftrender"
@@ -144,7 +143,3 @@ puts "\ncompared #{total_glyphs} glyphs; outline fails: #{total_outline_fails}, 
 ok = total_outline_fails.zero? && total_diff_pixels.zero?
 puts "RESULT: #{ok ? "PASS" : "FAIL"}"
 exit(ok ? 0 : 1)
-{% else %}
-puts "skip: WOFF2 support is not compiled in (build with -Dwith_woff2)"
-exit 0
-{% end %}

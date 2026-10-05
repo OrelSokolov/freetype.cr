@@ -1,14 +1,11 @@
 # WOFF2 unwrapping with a selectable brotli backend.
 #
-# The whole file is only compiled when the `with_woff2' compile-time flag
-# is given (`crystal build -Dwith_woff2 ...'), keeping the default build
-# free of the brotli decoder. Trying to load a WOFF2 font without the flag
-# raises a ParseError pointing at the flag (see `TT.unwrap_woff'). The
-# backend is chosen at compile time:
+# WOFF2 support is always compiled in. The backend is chosen at compile
+# time:
 #
 #   * default: the pure-Crystal decoder shard brotli.cr
-#   * -Dnative_brotli (together with -Dwith_woff2): libbrotlidec through
-#     FFI, for an all-C reference build
+#   * -Dnative_brotli: libbrotlidec through FFI, for an all-C reference
+#     build
 #
 # This is a port of FreeType's sfnt/sfwoff2.c (`woff2_open_font' plus the
 # glyf/loca/hmtx reconstruction). WOFF2 collections (flavor 'ttcf') are

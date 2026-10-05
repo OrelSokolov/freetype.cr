@@ -13,18 +13,15 @@
 # intentionally out of scope, and the variation tables (fvar/avar/gvar…)
 # live in tt/ttgxvar.cr (reached through `Font#raw_table'). WOFF1 wrappers are
 # unwrapped into a plain SFNT before parsing (see `TT.unwrap_woff');
-# WOFF2 too when built with -Dwith_woff2 (see tt/woff2.cr).
+# WOFF2 too, through the brotli decoder (see tt/woff2.cr).
 
 require "compress/zlib"
 require "io/memory"
 
-# WOFF2 support is opt-in and only compiled when the `with_woff2' flag is
-# given; the brotli backend is then chosen at compile time — the
-# pure-Crystal decoder shard by default, libbrotlidec through FFI with
-# the additional -Dnative_brotli flag (see tt/woff2.cr).
-{% if flag?(:with_woff2) %}
+# WOFF2 support is always compiled in; the brotli backend is chosen at
+# compile time -- the pure-Crystal decoder shard by default, libbrotlidec
+# through FFI with the -Dnative_brotli flag (see tt/woff2.cr).
 require "./woff2"
-{% end %}
 
 module TT
   # Composite glyph flags (ttgload.c).
@@ -221,9 +218,8 @@ module TT
   # stored raw (compLength == origLength) or zlib-compressed; the
   # result is a reconstructed SFNT with the original flavor, a fresh
   # table directory and the tables re-padded to 4-byte alignment.
-  # WOFF2 ('wOF2' magic) is unwrapped through the pure-Crystal brotli
-  # decoder when built with -Dwith_woff2 (see tt/woff2.cr); without the
-  # flag it is an error.
+  # WOFF2 ('wOF2' magic) is unwrapped through the brotli decoder
+  # (see tt/woff2.cr).
   # Bare collections ('ttcf') are returned as-is — they are handled
   # through `ttcf_face_offset'/`Font#@base' instead (slicing would
   # corrupt their file-relative table offsets). Any other input is
@@ -232,12 +228,7 @@ module TT
     if data.size >= 4 &&
        data[0] == 0x77 && data[1] == 0x4F &&
        data[2] == 0x46 && data[3] == 0x32 # 'wOF2'
-      {% if flag?(:with_woff2) %}
-        return TT.unwrap_woff2(data, face_index)
-      {% else %}
-        raise ParseError.new("WOFF2 fonts require a build with " \
-                             "-Dwith_woff2 (brotli)")
-      {% end %}
+      return TT.unwrap_woff2(data, face_index)
     end
 
     if data.size >= 44 &&
