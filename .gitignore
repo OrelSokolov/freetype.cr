@@ -22,3 +22,6 @@ trace_*.txt
 # shards checkout + lock (not committed for a library shard)
 /lib/
 /shard.lock
+
+# Rake build outputs
+/build/
