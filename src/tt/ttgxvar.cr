@@ -324,6 +324,30 @@ module TT
     end
   end
 
+  # One `MVAR' value record (ft_var_load_mvar): the metric tag, its
+  # (outer, inner) indices into the store, and the font-unit value
+  # captured before any variation was applied — repeated applications
+  # restore from `unmodified' rather than accumulate.
+  class MvarValue
+    getter tag : UInt32
+    getter outer_index : Int32
+    getter inner_index : Int32
+    property unmodified : Int32 = 0
+
+    def initialize(@tag : UInt32, @outer_index : Int32, @inner_index : Int32)
+    end
+  end
+
+  # The parsed `MVAR' table: the ItemVariationStore plus the tagged
+  # value records pointing into it.
+  class MvarTable
+    getter item_store : ItemVarStore
+    getter values : Array(MvarValue)
+
+    def initialize(@item_store : ItemVarStore, @values : Array(MvarValue))
+    end
+  end
+
   # The `gvar' table (ft_var_load_gvar): per-glyph offsets into the
   # variation data array plus the shared tuples.
   class GVar
@@ -418,6 +442,12 @@ module TT
     # loaded (TT_FACE_FLAG_VAR_HADVANCE/VADVANCE).
     getter hvar : HVVarTable?
     getter vvar : HVVarTable?
+    # The `MVAR' table, loaded lazily at the first set_var_design
+    # (ft_var_load_mvar), plus the design coordinates the deltas were
+    # last applied at (ftmm.c skips metrics_adjust when an identical
+    # re-set returns -1 from TT_Set_Var_Design).
+    getter mvar : MvarTable?
+    @mvar_design_coords : Array(Int64)? = nil
     # The raw `cvar' table (nil when absent).
     getter cvar : Bytes?
 
@@ -1303,6 +1333,130 @@ module TT
     end
 
     # --- raw big-endian readers ------------------------------------------
+
+    # ft_var_load_mvar: parse the `MVAR' table and snapshot the
+    # unmodified metric values. A missing or invalid table disables the
+    # adjustments (invalid records drop the whole table, as in FreeType).
+    def load_mvar(font : TT::Font) : Nil
+      return if @mvar
+      d = font.raw_table("MVAR")
+      return if d.nil? || d.size < 12
+      return if BE.u16(d, 0) != 1 # majorVersion
+
+      value_count = BE.u16(d, 8).to_i32
+      store_off = BE.u16(d, 10).to_i64
+      begin
+        store = ItemVarStore.load(d, store_off, @num_axis)
+      rescue ParseError
+        return
+      end
+
+      values = [] of MvarValue
+      pos = 12
+      value_count.times do
+        break if pos + 8 > d.size
+        tag = BE.u32(d, pos)
+        outer = BE.u16(d, pos + 4).to_i32
+        inner = BE.u16(d, pos + 6).to_i32
+        pos += 8
+        # OpenType 1.8.4+: no variation data for this item.
+        next if outer == 0xFFFF && inner == 0xFFFF
+        if outer >= store.var_data.size ||
+           inner >= store.var_data[outer].item_count
+          return # Invalid_Table: the whole table is dropped
+        end
+        values << MvarValue.new(tag, outer, inner)
+      end
+
+      values.each do |v|
+        v.unmodified = mvar_read(font, v.tag) || 0
+      end
+      @mvar = MvarTable.new(store, values)
+    end
+
+    # tt_apply_mvar: re-apply the `MVAR' deltas for the current normalized
+    # coordinates. The faces call this from set_var_design — FreeType runs
+    # the driver's metrics_adjust through ftmm.c whenever the design
+    # coordinates actually change, which this mirrors so the derived
+    # ascender/descender/height never get the same delta applied twice.
+    def apply_mvar(font : TT::Font, design_coords : Array(Int64),
+                   normalized : Array(Int64)) : Nil
+      mvar = @mvar
+      return unless mvar
+      if (last = @mvar_design_coords) && last == design_coords
+        return # identical re-set: TT_Set_Var_Design's -1, no adjust
+      end
+      @mvar_design_coords = design_coords.dup
+
+      hasc = 0
+      hdsc = 0
+      hlgp = 0
+      mvar.values.each do |v|
+        next if mvar_read(font, v.tag).nil? # unknown/unmodelled tag
+        delta = get_item_delta(mvar.item_store, normalized,
+                               v.outer_index, v.inner_index)
+        next if delta == 0 # FT: `if ( p && delta )'
+
+        # since both signed and unsigned fields are handled as FT_Short,
+        # the sum wraps at 16 bits like FreeType's assignment
+        patched = (v.unmodified.to_i16! + delta.to_i16!).to_i16!.to_i32
+        mvar_write(font, v.tag, patched)
+
+        case v.tag
+        when 0x68617363_u32 then hasc = delta # 'hasc'
+        when 0x68647363_u32 then hdsc = delta # 'hdsc'
+        when 0x686C6770_u32 then hlgp = delta # 'hlgp'
+        end
+      end
+
+      # Derived values (tt_apply_mvar tail): the typo deltas move the
+      # FT_Face line metrics no matter how they were originally computed,
+      # and the underline is recomputed from the possibly UNDO/UNDS-
+      # patched `post' values. FT_Short arithmetic throughout.
+      line_gap = (font.height.to_i16! - font.ascender.to_i16! +
+                  font.descender.to_i16!).to_i16!.to_i32
+      font.ascender = (font.ascender.to_i16! + hasc.to_i16!).to_i16!.to_i32
+      font.descender = (font.descender.to_i16! + hdsc.to_i16!).to_i16!.to_i32
+      font.height = (font.ascender.to_i16! - font.descender.to_i16! +
+                     line_gap.to_i16! + hlgp.to_i16!).to_i16!.to_i32
+      font.underline_position = (font.post_underline_position -
+                                 font.post_underline_thickness.tdiv(2))
+                                .to_i16!.to_i32
+      font.underline_thickness = font.post_underline_thickness.to_i16!.to_i32
+    end
+
+    # ft_var_get_value_pointer over the fields this port models; nil =
+    # tag unknown or not modelled here (vertical, caret, gasp,
+    # sub/superscript...), which FreeType-equivalently ignores.
+    private def mvar_read(font : TT::Font, tag : UInt32) : Int32?
+      case tag
+      when 0x68617363_u32 then font.typo_ascender          # 'hasc'
+      when 0x68647363_u32 then font.typo_descender         # 'hdsc'
+      when 0x686C6770_u32 then font.typo_line_gap          # 'hlgp'
+      when 0x68636C61_u32 then font.us_win_ascent.to_i16!.to_i32  # 'hcla'
+      when 0x68636C64_u32 then font.us_win_descent.to_i16!.to_i32 # 'hcld'
+      when 0x78686774_u32 then font.sx_height              # 'xhgt'
+      when 0x7374726F_u32 then font.y_strikeout_position   # 'stro'
+      when 0x73747273_u32 then font.y_strikeout_size       # 'strs'
+      when 0x756E646F_u32 then font.post_underline_position # 'undo'
+      when 0x756E6473_u32 then font.post_underline_thickness # 'unds'
+      end
+    end
+
+    private def mvar_write(font : TT::Font, tag : UInt32, value : Int32) : Nil
+      case tag
+      when 0x68617363_u32 then font.typo_ascender = value
+      when 0x68647363_u32 then font.typo_descender = value
+      when 0x686C6770_u32 then font.typo_line_gap = value
+      when 0x68636C61_u32 then font.us_win_ascent = value
+      when 0x68636C64_u32 then font.us_win_descent = value
+      when 0x78686774_u32 then font.sx_height = value
+      when 0x7374726F_u32 then font.y_strikeout_position = value
+      when 0x73747273_u32 then font.y_strikeout_size = value
+      when 0x756E646F_u32 then font.post_underline_position = value
+      when 0x756E6473_u32 then font.post_underline_thickness = value
+      end
+    end
 
   end
 end

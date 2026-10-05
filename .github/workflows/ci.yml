@@ -95,6 +95,9 @@ jobs:
       - name: cvar diff vs libfreetype (synthesized variable Liberation)
         run: crystal run --release --error-trace spec/var_cvar_diff.cr
 
+      - name: MVAR metric diff vs libfreetype (synthesized variable Liberation)
+        run: crystal run --release --error-trace spec/var_mvar_diff.cr
+
       - name: CFF2 variations diff vs libfreetype (SourceSerif4Variable)
         run: crystal run --release --error-trace spec/cff2_var_diff.cr
 

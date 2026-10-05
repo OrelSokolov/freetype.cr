@@ -349,15 +349,26 @@ module TT
     getter num_v_metrics : Int32
     getter vertical_info : Bool
     getter os2_version : UInt16 # 0xFFFF when there is no OS/2 table
-    getter typo_ascender : Int32
-    getter typo_descender : Int32
+    property typo_ascender : Int32
+    property typo_descender : Int32
+    property typo_line_gap : Int32 = 0
     getter os2_fs_selection : UInt16 = 0_u16 # USE_TYPO_METRICS = bit 7 (0x80)
-    getter us_win_ascent : Int32 = 0
-    getter us_win_descent : Int32 = 0
+    property us_win_ascent : Int32 = 0
+    property us_win_descent : Int32 = 0
+    # os2.yStrikeoutSize/yStrikeoutPosition (targets of the MVAR `strs'/
+    # `stro' tags) and os2.sxHeight (`xhgt', version 2+).
+    property y_strikeout_size : Int32 = 0
+    property y_strikeout_position : Int32 = 0
+    property sx_height : Int32 = 0
     getter mac_style : UInt16 = 0_u16 # head.macStyle: bit 1 = italic
     getter is_fixed_pitch : Bool = false # post.isFixedPitch
+    # post.underlinePosition/underlineThickness (targets of the MVAR
+    # `undo'/`unds' tags).
+    property post_underline_position : Int32 = 0
+    property post_underline_thickness : Int32 = 0
     getter hhea_ascender : Int32
     getter hhea_descender : Int32
+    getter hhea_line_gap : Int32 = 0
     getter max_points : Int32
     getter max_contours : Int32
     getter max_twilight : Int32
@@ -369,8 +380,13 @@ module TT
     getter cvt : Array(Int32) # raw font units
     getter fpgm : Bytes
     getter prep : Bytes
-    getter ascender : Int32 = 0   # FT_Face->ascender (see the selection below)
-    getter descender : Int32 = 0 # FT_Face->descender, negative
+    property ascender : Int32 = 0   # FT_Face->ascender (see the selection below)
+    property descender : Int32 = 0 # FT_Face->descender, negative
+    property height : Int32 = 0    # FT_Face->height
+    # FT_Face->underline_*: derived from the `post' values, recomputed by
+    # tt_apply_mvar when UNDO/UNDS deltas patch them.
+    property underline_position : Int32 = 0
+    property underline_thickness : Int32 = 0
     # Raw 'CFF ' table for CFF-flavoured OTF (empty for TrueType outlines).
     getter cff_table : Bytes = Bytes.new(0)
 
@@ -418,9 +434,12 @@ module TT
       @index_to_loc_format = i16(d, head[0] + 50).to_i32
       @mac_style = u16(d, head[0] + 44)
 
-      # post.isFixedPitch (offset 12 in the table header)
+      # post.isFixedPitch (offset 12 in the table header); the underline
+      # fields (offsets 8/10) — zero like FT's cleared struct when absent.
       if (post = tables["post"]?) && post[1] >= 16 && post[0] + 16 <= d.size
         @is_fixed_pitch = u32(d, post[0] + 12) != 0
+        @post_underline_position = i16(d, post[0] + 8).to_i32
+        @post_underline_thickness = i16(d, post[0] + 10).to_i32
       end
 
       maxp = table(tables, "maxp")
@@ -447,6 +466,7 @@ module TT
       @num_h_metrics = u16(d, hhea[0] + 34).to_i32
       @hhea_ascender = i16(d, hhea[0] + 4).to_i32
       @hhea_descender = i16(d, hhea[0] + 6).to_i32
+      @hhea_line_gap = i16(d, hhea[0] + 8).to_i32
       @hmtx = slice(tables, "hmtx")
 
       if tables.has_key?("vhea") && tables.has_key?("vmtx")
@@ -465,10 +485,19 @@ module TT
           @os2_version = u16(d, os2[0])
           @typo_ascender = i16(d, os2[0] + 68).to_i32
           @typo_descender = i16(d, os2[0] + 70).to_i32
+          @typo_line_gap = i16(d, os2[0] + 72).to_i32
+          # yStrikeoutSize/yStrikeoutPosition live well within the
+          # already-checked 72 bytes (offsets 26/28).
+          @y_strikeout_size = i16(d, os2[0] + 26).to_i32
+          @y_strikeout_position = i16(d, os2[0] + 28).to_i32
           if os2[1] >= 78 && os2[0] + 78 <= d.size
             @os2_fs_selection = u16(d, os2[0] + 62)
             @us_win_ascent = u16(d, os2[0] + 74).to_i32
             @us_win_descent = u16(d, os2[0] + 76).to_i32
+          end
+          # sxHeight exists from OS/2 version 2 on (offset 86).
+          if os2[1] >= 88 && os2[0] + 88 <= d.size && @os2_version >= 2
+            @sx_height = i16(d, os2[0] + 86).to_i32
           end
         else
           @os2_version = 0xFFFF_u16
@@ -646,26 +675,44 @@ module TT
       end
     end
 
-    # FT_Face->ascender/descender selection (sfnt_load_face, sfobjs.c):
-    # OS/2 USE_TYPO_METRICS wins, then `hhea', with typo and usWin*
-    # fallbacks when hhea carries zeroes.
+    # FT_Face->ascender/descender/height/underline selection
+    # (sfnt_load_face, sfobjs.c): OS/2 USE_TYPO_METRICS wins, then
+    # `hhea', with typo and usWin* fallbacks when hhea carries zeroes.
     private def compute_vertical_face_metrics : Nil
       if @os2_version != 0xFFFF_u16 && (@os2_fs_selection & 0x80_u16) != 0
         @ascender = @typo_ascender
         @descender = @typo_descender
-        return
-      end
-      @ascender = @hhea_ascender
-      @descender = @hhea_descender
-      return unless @ascender == 0 && @descender == 0
-      return if @os2_version == 0xFFFF_u16
-      if @typo_ascender != 0 || @typo_descender != 0
-        @ascender = @typo_ascender
-        @descender = @typo_descender
+        @height = @ascender - @descender + @typo_line_gap
       else
-        @ascender = @us_win_ascent
-        @descender = -@us_win_descent
+        @ascender = @hhea_ascender
+        @descender = @hhea_descender
+        @height = @ascender - @descender + @hhea_line_gap
+        unless @ascender == 0 && @descender == 0
+          set_underline_metrics
+          return
+        end
+        unless @os2_version == 0xFFFF_u16
+          if @typo_ascender != 0 || @typo_descender != 0
+            @ascender = @typo_ascender
+            @descender = @typo_descender
+            @height = @ascender - @descender + @typo_line_gap
+          else
+            @ascender = @us_win_ascent
+            @descender = -@us_win_descent
+            @height = @ascender - @descender
+          end
+        end
       end
+      set_underline_metrics
+    end
+
+    # sfnt_load_face's post-script adjustment: FT derives the underline
+    # metrics (top edge -> centre of stroke) from the `post' values;
+    # tt_apply_mvar recomputes exactly this after UNDO/UNDS deltas.
+    private def set_underline_metrics : Nil
+      @underline_position = (@post_underline_position -
+                             @post_underline_thickness.tdiv(2)).to_i16!.to_i32
+      @underline_thickness = @post_underline_thickness.to_i16!.to_i32
     end
 
     # Glyph data range within `glyf' (loca[gid] .. loca[gid+1]); an empty

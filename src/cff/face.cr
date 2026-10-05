@@ -96,6 +96,10 @@ module CFF
       # VariationStore (cff_blend_doBlend); FreeType re-parses them
       # whenever the blend vector changes.
       @cff.reblend_private_dicts(@vstore, @normalized)
+      # tt_apply_mvar (ftmm.c runs the driver's metrics_adjust whenever
+      # the coordinates change): re-apply the `MVAR' metric deltas.
+      blend.load_mvar(@font)
+      blend.apply_mvar(@font, cs, @normalized)
     end
 
     # The current design coordinates (empty for a static/unset face).

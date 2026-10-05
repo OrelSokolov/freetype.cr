@@ -89,7 +89,12 @@ render.
   variations — the CFF2 table layout, the `blend'/`vsindex' operators in
   charstrings and Private DICTs (cff_blend_doBlend writes the results
   back into the operand stack), HVAR advances and the vstore parsing
-  (spec/cff2_var_diff.cr, SourceSerif4Variable); MVAR comes later;
+  (spec/cff2_var_diff.cr, SourceSerif4Variable) — and `MVAR' metric
+  variations: the tagged deltas re-apply to the modelled font fields
+  (typo/win/line-gap metrics, underline, strikeout, x-height) with
+  FreeType's exact repeated-application semantics, including the derived
+  ascender/descender/height adjustments of tt_apply_mvar
+  (spec/var_mvar_diff.cr on a synthesized Liberation font);
   `Font#raw_table' hands this module the raw tables.
 - `src/tt/sfnt.cr` — a minimal SFNT parser: head, maxp, hhea, hmtx,
   cmap (formats 4 and 12), loca, glyf, cvt, fpgm, prep, gasp, kern.

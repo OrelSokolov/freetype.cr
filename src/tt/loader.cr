@@ -192,6 +192,10 @@ module TT
       @design_coords = cs
       @normalized = blend.to_normalized(cs)
       @doblend = true
+      # tt_apply_mvar (ftmm.c runs the driver's metrics_adjust whenever
+      # the coordinates change): re-apply the `MVAR' metric deltas.
+      blend.load_mvar(font)
+      blend.apply_mvar(font, cs, @normalized)
       # TT_Set_Var_Design leaves the normalized coordinates in
       # face->blend, where the interpreter's GETVARIATION/GETDATA and
       # GETINFO's VARIATION GLYPH bit read them.

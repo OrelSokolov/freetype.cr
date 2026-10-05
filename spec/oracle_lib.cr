@@ -79,7 +79,11 @@ lib LibFT
     units_per_em : UInt16 # @136
     ascender : Int16      # @138
     descender : Int16     # @140
-    pad1 : UInt8[10]      # @142..152
+    height : Int16        # @142
+    max_advance_width : Int16   # @144
+    max_advance_height : Int16  # @146
+    underline_position : Int16  # @148
+    underline_thickness : Int16 # @150
     glyph : GlyphSlotRec* # @152
     size : Void*          # @160
   end
